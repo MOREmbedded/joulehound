@@ -150,7 +150,8 @@ round-tripping through real files.
 | --- | --- |
 | Sustained bulk IN | **7.75 MiB/s** |
 | Rate achieved, 1 Msps | **99.99–100.00%** of requested, measured from real samples |
-| Rates 1 k / 10 k / 100 k / 200 k / 500 k / 1 M | **12 of 12 runs at ~100%** |
+| Rates 1 k / 10 k / 100 k / 200 k / 500 k / 1 M | 100% on most runs; an occasional run lands lower (one 200 kHz run measured 84%) |
+| Statistics | 2 Hz blocks arriving on time, charge and energy accumulating monotonically |
 | Frame integrity | 0 undecodable, 0 sequence breaks |
 | Gap fill | ~126 NaN samples per run, all at stream startup |
 | Capture, 1 Msps binary | 2,999,808 rows in 3.001 s — exactly 1 Msps, 34.33 MiB |
@@ -182,9 +183,19 @@ hostage until enough replies accumulate to fill it.
 
 ### Known gaps
 
-- `jsctl stats` emits its first statistics record and then stalls; the
-  streaming and capture paths are unaffected. The power standard deviation and
-  maximum also read exactly zero, which is not yet explained.
+- **Power statistics are not trustworthy.** With the power port disabled, the
+  instrument reports a power minimum that never changes and a standard
+  deviation and maximum of exactly zero, so those fields are evidently not
+  being updated. Current and voltage statistics, and the charge and energy
+  accumulators, behave correctly. Treat `power` in `jsctl stats` as unverified.
+- Stream startup is not perfectly uniform: most runs reach 100% of the
+  requested rate, but an occasional run comes in lower. Capture also discards
+  the first fraction of a second while the stream settles, so a short capture
+  yields slightly fewer rows than `duration × rate`.
+- Statistics require that no sample stream is enabled. Enabling one alongside
+  them stops the instrument emitting statistics after the first record, so
+  `jsctl stats` runs with every data port off. The cause is not understood;
+  the official tool does the same.
 - The `u4` and `u1` run-length decoders are implemented to spec but no firmware
   emits those streams compressed, so they are covered by unit tests only.
 

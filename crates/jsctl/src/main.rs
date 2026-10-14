@@ -425,8 +425,9 @@ fn cmd_stats(args: &StatsArgs) -> Result<()> {
         ..Default::default()
     };
     // Statistics are computed on the instrument, so no sample streams are
-    // needed; asking for none keeps the USB link almost idle.
-    cfg.signals = vec![Signal::Current];
+    // enabled: that keeps the USB link almost idle, and enabling one alongside
+    // them stops the instrument emitting statistics after the first record.
+    cfg.signals = vec![];
     cfg.validate().context("invalid statistics configuration")?;
     dev.stream_start(cfg).context("starting statistics")?;
 

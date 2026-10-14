@@ -145,9 +145,12 @@ impl Default for StreamConfig {
 impl StreamConfig {
     /// Reject configurations the instrument cannot produce.
     pub fn validate(&self) -> Result<()> {
-        if self.signals.is_empty() {
+        // Statistics are computed on the instrument and need no sample stream,
+        // so a statistics-only session is legitimate and leaves the USB link
+        // almost idle.
+        if self.signals.is_empty() && !self.statistics {
             return Err(Error::Config {
-                reason: "no signals selected".into(),
+                reason: "no signals selected and statistics are disabled".into(),
             });
         }
         let fs = self.sample_rate;
