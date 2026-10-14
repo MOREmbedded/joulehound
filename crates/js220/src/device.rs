@@ -28,10 +28,10 @@ pub const MIN_SAMPLE_RATE: u32 = 1_000;
 const SETTLE: Duration = Duration::from_millis(250);
 
 /// How long to wait for the device to acknowledge a publish.
-const ACK_TIMEOUT: Duration = Duration::from_millis(1500);
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long to let a backlog drain when forcing the device quiet.
-const QUIESCE: Duration = Duration::from_millis(400);
+/// How long to wait for a pub/sub round trip.
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Every topic that enables a data port.
 const ALL_STREAM_CTRL: [&str; 4] = [
@@ -71,20 +71,6 @@ const V_RANGE_MODE_MANUAL: u8 = 1;
 const V_RANGE_2V: u8 = 1;
 /// Voltage range selector for the 15 V range.
 const V_RANGE_15V: u8 = 0;
-
-/// Pick a starting ping value unlikely to collide with a previous session's.
-///
-/// Only the low byte survives the device's round trip, so the seed has to fit
-/// in a `u8`. That is a small space, but it still makes accepting a stale pong
-/// from an earlier process unlikely rather than near-certain, which a fixed
-/// start of 1 made it.
-fn session_ping_seed() -> u8 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(1, |d| d.subsec_nanos());
-    (nanos % 251) as u8 + 1
-}
 
 /// Current range selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -261,9 +247,9 @@ pub struct Js220 {
     config: Option<StreamConfig>,
     params: HashMap<String, Value>,
     statistics: Option<Statistics>,
-    /// Low byte of the most recent pong, used as a round-trip barrier.
-    last_pong: Option<u8>,
-    next_ping: u8,
+    /// Value carried by the most recent pong, used as a round-trip barrier.
+    last_pong: Option<u32>,
+    next_ping: u32,
     time_map: TimeMap,
     counters: Counters,
     expect_frame_id: Option<u16>,
@@ -317,11 +303,7 @@ impl Js220 {
             params: HashMap::new(),
             statistics: None,
             last_pong: None,
-            // Seeded per session rather than from a fixed value. The device
-            // can still have pongs queued from a previous process, and a
-            // counter that always starts at 1 would accept one of those as the
-            // answer to a ping it never saw.
-            next_ping: session_ping_seed(),
+            next_ping: 1,
             time_map: TimeMap::new(),
             counters: Counters::default(),
             expect_frame_id: None,
@@ -339,25 +321,44 @@ impl Js220 {
         // removed: those are hundreds of messages, and configuration published
         // on their heels was being dropped. Commands that need the topic tree
         // ask for it explicitly instead.
-        dev.drain(SETTLE);
-
-        // The stream enables are retained values that survive a disconnect, so
-        // a device left streaming by an interrupted session is still streaming
-        // now. Force every port off and let the backlog drain, otherwise the
-        // next `stream_start` is racing a flood of stale samples.
-        dev.quiesce();
+        // Follow the reference driver's open sequence. Connecting does not
+        // leave the instrument in a state the host can rely on, and publishing
+        // only the few topics a capture needs leaves everything else as the
+        // previous session left it — which makes streaming fail to start.
+        dev.restore_defaults()?;
         Ok(dev)
     }
 
-    /// Disable every data port and discard whatever is still in flight.
-    fn quiesce(&mut self) {
-        for topic in ALL_STREAM_CTRL {
-            if let Err(e) = self.publish(topic, Value::U8(0)) {
-                log::debug!("quiesce {topic}: {e}");
-            }
+    /// Push the known-good parameter set and leave the device quiet.
+    ///
+    /// Mirrors the reference driver: request metadata, barrier, restore every
+    /// parameter, request the retained values, barrier. The barriers matter —
+    /// the instrument processes messages in order, so a returned pong proves
+    /// the restore has been applied before anything is enabled.
+    fn restore_defaults(&mut self) -> Result<()> {
+        self.request_metadata()?;
+        self.barrier();
+
+        for param in crate::defaults::DEFAULTS {
+            self.publish(param.topic, param.value.clone())?;
         }
-        self.drain(QUIESCE);
+
+        self.request_values()?;
+        self.barrier();
+
         self.group.reset();
+        Ok(())
+    }
+
+    /// Wait for the device to catch up, logging rather than failing if it does
+    /// not answer in time.
+    ///
+    /// A missed pong is not proof of a broken device, and failing the open over
+    /// one would turn a slow reply into an unusable instrument.
+    fn barrier(&mut self) {
+        if let Err(e) = self.ping(PING_TIMEOUT) {
+            log::debug!("no sequencing pong: {e}");
+        }
     }
 
     /// Poll for `duration`, discarding whatever arrives.
@@ -389,7 +390,7 @@ impl Js220 {
         let value = self.next_ping;
         self.next_ping = self.next_ping.wrapping_add(1).max(1);
         self.last_pong = None;
-        self.publish_raw(js220_proto::pubsub::TOPIC_PING, Value::U32(value as u32))?;
+        self.publish_raw(js220_proto::pubsub::TOPIC_PING, Value::U32(value))?;
 
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -621,6 +622,12 @@ impl Js220 {
                 Signal::Power => None,
             })
             .collect();
+        // Resize the bulk IN queue *before* enabling anything. Retuning cancels
+        // every pending transfer, so doing it after the enables would pull the
+        // device's buffers away the instant it started sending and stall the
+        // stream it had just acknowledged.
+        self.link.set_streaming_transfers();
+
         for topic in &ctrl_topics {
             // The instrument declares the ctrl topics as u8; publishing the
             // type it expects avoids relying on its coercion rules.
@@ -670,6 +677,7 @@ impl Js220 {
             return Ok(());
         }
         self.streaming = false;
+        self.link.set_config_transfers();
         // Turn everything off even if one publish fails, so a partial failure
         // does not leave the instrument streaming into a queue nobody drains.
         let mut first_err = None;
@@ -787,8 +795,10 @@ impl Js220 {
                     js220_proto::port0::encode_timesync_response(ts.start_count, recv, time::now());
                 responses.push((frame::PORT_ADMIN, payload));
                 self.counters.timesyncs += 1;
+                log::debug!("timesync #{} answered", self.counters.timesyncs);
             }
             Port0Body::TimeMap(tm) => {
+                log::debug!("timemap counter={} rate={}", tm.counter, tm.counter_rate_hz());
                 self.time_map
                     .update(tm.utc_q30, tm.counter, tm.counter_rate_hz());
             }
@@ -804,10 +814,7 @@ impl Js220 {
             Ok(msg) => {
                 log::trace!("pubsub {} = {:?}", msg.topic, msg.value);
                 if msg.topic == js220_proto::pubsub::TOPIC_PONG {
-                    // Compared narrowly: the device echoes the ping through a
-                    // narrower field than it was published in, so only the low
-                    // byte reliably survives the round trip.
-                    self.last_pong = msg.value.as_i64().map(|v| v as u8);
+                    self.last_pong = msg.value.as_i64().map(|v| v as u32);
                 }
                 self.params.insert(msg.topic, msg.value);
             }
@@ -910,6 +917,9 @@ impl Js220 {
     /// leaving it half-applied for the next session.
     pub fn close(mut self) -> Result<()> {
         self.streaming = false;
+        // Small transfers again so the disable acknowledgements are not stuck
+        // waiting for a large buffer to fill.
+        self.link.set_config_transfers();
         for topic in ALL_STREAM_CTRL {
             let _ = self.publish(topic, Value::U8(0));
         }
@@ -926,6 +936,7 @@ impl Drop for Js220 {
         // Order matters: stop the ports and disconnect before reclaiming the
         // transfers, or the endpoint can be left halted for the next session.
         self.streaming = false;
+        self.link.set_config_transfers();
         for topic in ALL_STREAM_CTRL {
             let _ = self.publish(topic, Value::U8(0));
         }

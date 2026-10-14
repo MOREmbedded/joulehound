@@ -153,6 +153,16 @@ pub struct TransportConfig {
     /// The device must never find the queue empty or it will drop samples, so
     /// this needs to cover the worst-case scheduling delay of the consumer.
     pub transfers_in_flight: usize,
+    /// Bytes per bulk IN transfer while configuring rather than streaming.
+    ///
+    /// Every frame the device sends is exactly 512 bytes, which is also the
+    /// endpoint's maximum packet size, so a transfer is never terminated early
+    /// by a short packet: it completes only once it is full. A large transfer
+    /// therefore holds a trickle of configuration replies hostage until enough
+    /// of them accumulate to fill it. Configuration uses a small transfer so
+    /// replies arrive promptly; streaming switches to `transfer_size`, where
+    /// the data rate fills buffers in milliseconds.
+    pub config_transfer_size: usize,
     /// Timeout applied to control transfers.
     pub control_timeout: Duration,
 }
@@ -164,17 +174,28 @@ impl Default for TransportConfig {
             // ~60 completions per second per queued transfer.
             transfer_size: 128 * 1024,
             transfers_in_flight: 8,
+            // Eight frames: enough to batch a burst of replies, small enough
+            // that a single reply is never delayed by more than a few frames.
+            config_transfer_size: 8 * FRAME_LEN,
             control_timeout: Duration::from_millis(1000),
         }
     }
 }
 
 impl TransportConfig {
-    /// The transfer size actually used: rounded up to a whole frame and at
-    /// least one frame.
+    /// The streaming transfer size: rounded up to a whole frame and at least
+    /// one frame.
     pub fn effective_transfer_size(&self) -> usize {
-        let frames = self.transfer_size.div_ceil(FRAME_LEN).max(1);
-        frames * FRAME_LEN
+        Self::round_to_frames(self.transfer_size)
+    }
+
+    /// The configuration transfer size, rounded the same way.
+    pub fn effective_config_transfer_size(&self) -> usize {
+        Self::round_to_frames(self.config_transfer_size)
+    }
+
+    fn round_to_frames(n: usize) -> usize {
+        n.div_ceil(FRAME_LEN).max(1) * FRAME_LEN
     }
 
     /// Bytes of host memory the IN queue will pin.
@@ -209,7 +230,10 @@ impl Link {
             .endpoint::<Bulk, Out>(proto::EP_BULK_OUT)
             .usb_context("opening bulk OUT endpoint")?;
 
-        let transfer_size = cfg.effective_transfer_size();
+        // Start small so the connect response and configuration replies are
+        // delivered as they arrive rather than waiting for a large transfer to
+        // fill. `set_streaming_transfers` switches over once data is flowing.
+        let transfer_size = cfg.effective_config_transfer_size();
         let mut link = Self {
             interface,
             ep_in,
@@ -293,6 +317,34 @@ impl Link {
             });
         }
         Ok(())
+    }
+
+    /// Switch the bulk IN queue to the large streaming transfer size.
+    ///
+    /// Re-queues every buffer, so call this once configuration is complete and
+    /// before throughput matters.
+    pub fn set_streaming_transfers(&mut self) {
+        self.retune(self.cfg.effective_transfer_size());
+    }
+
+    /// Switch the bulk IN queue back to the small configuration size.
+    pub fn set_config_transfers(&mut self) {
+        self.retune(self.cfg.effective_config_transfer_size());
+    }
+
+    fn retune(&mut self, size: usize) {
+        if self.transfer_size == size {
+            return;
+        }
+        log::debug!("bulk IN transfer size {} -> {size}", self.transfer_size);
+        self.cancel_in();
+        self.transfer_size = size;
+        self.prime();
+    }
+
+    /// Bytes per queued bulk IN transfer right now.
+    pub fn transfer_size(&self) -> usize {
+        self.transfer_size
     }
 
     /// Fill the bulk IN queue up to the configured depth.
