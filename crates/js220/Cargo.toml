@@ -1,7 +1,14 @@
 [package]
 name = "js220"
+description = "Fast host driver for the Joulescope JS220 precision energy analyzer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
+js220-proto = { workspace = true }
+nusb = "0.2"
+log = "0.4"

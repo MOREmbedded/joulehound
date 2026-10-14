@@ -468,10 +468,11 @@ mod tests {
 
     #[test]
     fn u4_rle_expands_runs() {
-        // value 3, run 1; value 5, run 4096
+        // Chunks are `zzzzzzzz_zzzzxxxx`: run length minus one, then value.
+        let chunk = |value: u16, run: u16| (value | ((run - 1) << 4)).to_le_bytes();
         let mut data = Vec::new();
-        data.extend_from_slice(&(3u16 | (0 << 4)).to_le_bytes());
-        data.extend_from_slice(&(5u16 | (4095 << 4)).to_le_bytes());
+        data.extend_from_slice(&chunk(3, 1));
+        data.extend_from_slice(&chunk(5, 4096));
         let mut out = Vec::new();
         let n = decode_u4_rle(&data, &mut out);
         assert_eq!(n, 1 + 4096);
