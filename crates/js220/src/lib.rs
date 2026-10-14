@@ -55,6 +55,7 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod decimate;
 pub mod defaults;
 pub mod device;
 pub mod error;

@@ -23,6 +23,16 @@ pub const MAX_SAMPLE_RATE: u32 = 1_000_000;
 /// Lowest rate the instrument can decimate to on its own.
 pub const MIN_SAMPLE_RATE: u32 = 1_000;
 
+/// Sample id step between consecutive samples as the instrument sends them,
+/// which is fixed at its 1 Msps analog output rate.
+const DEVICE_SAMPLE_STEP: u32 = BASE_RATE / MAX_SAMPLE_RATE;
+
+/// How long to wait for a port 0 echo to come back.
+const ECHO_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How many echoes to try before declaring the output path dead.
+const ECHO_ATTEMPTS: u32 = 10;
+
 /// How long to let the device settle after a state change before trusting what
 /// arrives to belong to the new state.
 const SETTLE: Duration = Duration::from_millis(250);
@@ -169,8 +179,8 @@ impl StreamConfig {
         (BASE_RATE / self.sample_rate).max(1)
     }
 
-    /// Decimation factor the instrument applies to the analog signals.
-    pub fn instrument_decimation(&self) -> u32 {
+    /// Number of 1 Msps samples averaged into each output sample.
+    pub fn host_decimation(&self) -> u32 {
         (MAX_SAMPLE_RATE / self.sample_rate).max(1)
     }
 
@@ -247,6 +257,8 @@ pub struct Js220 {
     config: Option<StreamConfig>,
     params: HashMap<String, Value>,
     statistics: Option<Statistics>,
+    /// Token from the most recent port 0 echo reply.
+    last_echo: Option<u32>,
     /// Low byte of the most recent pong, used as a round-trip barrier.
     last_pong: Option<u8>,
     next_ping: u8,
@@ -302,6 +314,7 @@ impl Js220 {
             config: None,
             params: HashMap::new(),
             statistics: None,
+            last_echo: None,
             last_pong: None,
             // Seeded per session rather than from a fixed value. The device
             // can still have pongs queued from a previous process, and a
@@ -315,18 +328,64 @@ impl Js220 {
         };
         dev.await_connect(Duration::from_millis(3000))?;
 
-        // The instrument is not ready for configuration the instant it
-        // acknowledges the connect: it still has its metadata and retained
-        // values to publish. Walking through that exchange and closing it with
-        // a ping gives a barrier, so a `stream_start` issued immediately after
-        // `open` cannot be dropped on the floor.
         // Let the device finish its own post-connect chatter before returning.
         // Requesting the full metadata and value dump here was tried and
         // removed: those are hundreds of messages, and configuration published
         // on their heels was being dropped. Commands that need the topic tree
         // ask for it explicitly instead.
         dev.drain(SETTLE);
+
+        // Prove the bulk OUT path actually reaches the device before trusting
+        // it with configuration. Port 0 echo is a pure loopback: the device
+        // returns the payload unchanged, so a completed round trip is positive
+        // evidence that frames sent now are being acted on. A bulk OUT
+        // transfer completing only means the host controller accepted it,
+        // which says nothing about whether the device processed it.
+        dev.sync_output()?;
+
+        // Push the full known-good parameter set. Connecting does not leave
+        // the instrument in a state the host can rely on, and a session that
+        // configured only the few topics it needed leaves the rest as the
+        // previous one left them — after which streaming stops starting at
+        // all, and no amount of re-enabling recovers it. The reference driver
+        // restores every parameter on open for this reason.
+        dev.restore_defaults()?;
         Ok(dev)
+    }
+
+    /// Publish the captured known-good parameter set.
+    fn restore_defaults(&mut self) -> Result<()> {
+        for param in crate::defaults::DEFAULTS {
+            self.publish(param.topic, param.value.clone())?;
+        }
+        // Let the instrument work through them before anything else is asked
+        // of it; they are applied in order and the list is long.
+        self.drain(SETTLE);
+        self.group.reset();
+        Ok(())
+    }
+
+    /// Round-trip port 0 echoes until one comes back.
+    fn sync_output(&mut self) -> Result<()> {
+        for attempt in 1..=ECHO_ATTEMPTS {
+            let token = 0xA5A5_0000u32 | attempt;
+            let payload = js220_proto::port0::encode_echo(&token.to_le_bytes());
+            self.last_echo = None;
+            self.link.send_frame(frame::PORT_ADMIN, &payload)?;
+
+            let deadline = Instant::now() + ECHO_TIMEOUT;
+            while Instant::now() < deadline {
+                self.poll(Duration::from_millis(20))?;
+                if self.last_echo == Some(token) {
+                    log::debug!("bulk OUT confirmed after {attempt} echo(es)");
+                    return Ok(());
+                }
+            }
+            log::debug!("echo attempt {attempt} unanswered");
+        }
+        Err(Error::Timeout {
+            context: "a port 0 echo confirming the output path",
+        })
     }
 
     /// Poll for `duration`, discarding whatever arrives.
@@ -512,19 +571,23 @@ impl Js220 {
             }
         }
 
-        // Rates below the maximum are produced by the instrument's decimation
-        // filter, so the host never sees the samples it would have discarded.
-        let n = config.instrument_decimation();
-        if n > 1 {
-            self.publish("s/dwnN/N", Value::U32(n))?;
-            self.publish("s/gpi/+/dwnN/N", Value::U32(config.decimate()))?;
-        }
-
         let device_signals = config.device_signals();
-        // Bridge at most a second of dropout before re-anchoring; a longer gap
-        // is not a dropout, it is a stale or bogus sample id.
-        let max_fill = config.sample_rate as usize;
-        self.group = SignalGroup::new(&device_signals, config.decimate(), max_fill);
+        // Bridge at most a few milliseconds of dropout. A longer gap is not a
+        // dropout, it is a device that has stopped sending, and synthesizing
+        // NaN across it manufactures rows that make a dead stream look like a
+        // healthy one.
+        let max_fill = (config.sample_rate as usize / 100).max(16);
+        // The instrument always streams at its 1 Msps ceiling; lower rates are
+        // produced by averaging on the host. Its own decimation needs a filter
+        // mode that is not exposed in the topic metadata, and configuring the
+        // divider alone silently produced no samples at all.
+        self.group = SignalGroup::with_decimation(
+            &device_signals,
+            config.decimate(),
+            max_fill,
+            config.host_decimation(),
+            DEVICE_SAMPLE_STEP,
+        );
         self.power.clear();
         self.scratch.clear();
         self.expect_frame_id = None;
@@ -689,7 +752,12 @@ impl Js220 {
                 self.time_map
                     .update(tm.utc_q30, tm.counter, tm.counter_rate_hz());
             }
-            Port0Body::Echo(_) => {}
+            Port0Body::Echo(data) => {
+                if data.len() >= 4 {
+                    let bytes: [u8; 4] = data[..4].try_into().expect("checked length");
+                    self.last_echo = Some(u32::from_le_bytes(bytes));
+                }
+            }
         }
         if msg.op == Port0Op::Connect && msg.status != 0 {
             log::warn!("connect status {}", msg.status);
@@ -879,10 +947,10 @@ mod tests {
     }
 
     #[test]
-    fn instrument_decimation_is_relative_to_the_one_msps_ceiling() {
-        assert_eq!(cfg(1_000_000).instrument_decimation(), 1);
-        assert_eq!(cfg(500_000).instrument_decimation(), 2);
-        assert_eq!(cfg(1_000).instrument_decimation(), 1000);
+    fn host_decimation_is_relative_to_the_one_msps_ceiling() {
+        assert_eq!(cfg(1_000_000).host_decimation(), 1);
+        assert_eq!(cfg(500_000).host_decimation(), 2);
+        assert_eq!(cfg(1_000).host_decimation(), 1000);
     }
 
     #[test]

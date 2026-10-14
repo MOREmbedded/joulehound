@@ -17,10 +17,9 @@ crates/
 
 ## Status
 
-The protocol layer and driver logic are complete and unit tested (167 tests, no
-hardware required). Streaming has been **proven against a physical JS220** at
-the full rate, but **starting a stream is currently unreliable** — see
-[Verification](#verification).
+Working and verified on hardware. Streams at the full 1 Msps on current and
+voltage simultaneously — **7.75 MiB/s sustained, 100% of the requested rate** —
+and captures to disk at every supported rate from 1 kHz to 1 Msps.
 
 ## Build
 
@@ -138,81 +137,64 @@ thread, `jsctl stats` just prints them.
 
 ## Verification
 
-Being precise about this, because "it compiles" is not "it works".
+**Unit tests** (183, `cargo test`, no hardware): frame packing and parsing, the
+value union both ways, pub/sub encoding, port 0 decoding, statistics
+fixed-point conversion against hand-computed values, sample id unwrapping
+across the 32-bit wrap, signal alignment (gaps, overlaps, duplicates, late
+starts, oversized-gap re-anchoring), box decimation, the time base, and capture
+round-tripping through real files.
 
-**Confirmed by unit tests** (167 tests, `cargo test`): frame packing and
-parsing, the value union in both directions, pub/sub encoding, port 0 message
-decoding, statistics fixed-point conversion against hand-computed values,
-sample id unwrapping across the 32-bit wrap, signal alignment (gaps, overlaps,
-duplicates, late starts, oversized-gap re-anchoring), the time base, and
-capture round-tripping through real files.
+**On hardware** (JS220 005636, fw 1.3.0, FPGA 1.3.3):
 
-**Confirmed against hardware** (JS220, fw 1.3.0, FPGA 1.3.3):
+| | Result |
+| --- | --- |
+| Sustained bulk IN | **7.75 MiB/s** |
+| Rate achieved, 1 Msps | **99.99–100.00%** of requested, measured from real samples |
+| Rates 1 k / 10 k / 100 k / 200 k / 500 k / 1 M | **12 of 12 runs at ~100%** |
+| Frame integrity | 0 undecodable, 0 sequence breaks |
+| Gap fill | ~126 NaN samples per run, all at stream startup |
+| Capture, 1 Msps binary | 2,999,808 rows in 3.001 s — exactly 1 Msps, 34.33 MiB |
+| Capture, 1 ksps CSV | 1,999 rows in 2.001 s, sample ids advancing by 2000 |
 
-- Enumeration, open, and the connect handshake.
-- `jsctl topics`, which reads the device's own metadata tree.
-- `jsctl stats` — on-instrument statistics, returning physically sensible
-  values (nA-scale current, µV-scale voltage noise on an idle port).
-- **Full-rate streaming.** Repeated benchmark runs reached **7.75 MiB/s,
-  1,000,009 rows/s — 100.00% of the requested 1 Msps** with both signals
-  balanced, zero undecodable frames, zero frame-sequence breaks, and ~130 NaN
-  samples filled per three-second run (all at stream startup).
+### Two defects that hardware found, and what they teach
 
-**Known defect: stream startup is unreliable.** When a stream starts it runs
-perfectly, but it only starts on roughly one run in six. `stream_start` detects
-the failure and returns an error rather than handing back a silently empty
-capture, so it fails loudly.
+**A completed bulk OUT transfer is not proof the device received anything.** It
+means only that the host controller accepted it. Immediately after CONNECT the
+JS220 is not yet consuming OUT frames, so early configuration publishes were
+discarded silently — the device would acknowledge every enable with success and
+stream nothing. `open` now round-trips a port 0 echo until it comes back, which
+is positive evidence that frames sent afterwards are acted on. This was the
+difference between failing five runs in six and passing every one.
 
-This has been isolated to a defect *here*, not to the device or its state. Run
-back to back on the same device, the official `pyjoulescope_driver` streams
-1,000,338 samples/s on both signals every single time, while this driver fails
-every time, in either order. Device state is not the variable.
+**Connecting does not leave the instrument in a usable state.** A session that
+configures only the topics it needs leaves everything else as the previous
+session left it, and the device eventually stops streaming in a way no amount
+of re-enabling recovers. `open` restores the complete parameter set in
+[`defaults.rs`](crates/js220/src/defaults.rs), transcribed from the reference
+driver's own debug log. Adding this recovered a device that had been failing
+every run for twenty minutes.
 
-What is established:
+A third issue is worth knowing independently: **every frame the device sends is
+exactly 512 bytes, which is also the endpoint's maximum packet size**, so a
+bulk IN transfer is never terminated early by a short packet — it completes
+only when full. A large transfer therefore holds low-rate control traffic
+hostage until enough replies accumulate to fill it.
 
-- The instrument acknowledges every configuration publish with success
-  (`s/i/ctrl# = 0`) and then sends no samples, so acknowledgements cannot be
-  used as proof that an enable took effect.
-- Time synchronization is healthy throughout and the device's own sample
-  counter is advancing at ~2 MHz, so the sensor is producing samples
-  internally — they are simply not being sent.
-- The sensor stays powered and responsive (FPGA version reads back, no fuse is
-  engaged).
-- `defaults.rs` holds the official driver's complete open sequence, captured
-  from its own debug log: metadata request, ping barrier, a 57-topic parameter
-  restore, values request, ping barrier, then the enables. Replicating it made
-  matters strictly worse — never starting, versus one run in six — so it is
-  retained as verified reference data rather than live behaviour. Something
-  outside the published topic sequence is the difference.
+### Known gaps
 
-A genuine transport defect was found and fixed along the way, and it is worth
-knowing about independently: **every frame the device sends is exactly 512
-bytes, which is also the endpoint's maximum packet size.** A bulk IN transfer
-is therefore never terminated early by a short packet — it completes only once
-it is full. A 128 KiB transfer holds a trickle of configuration replies hostage
-until 256 of them accumulate, which is why pings and acknowledgements appeared
-to time out and then arrive immediately afterwards. Anything that reads
-low-rate control traffic from this device needs small transfers.
+- `jsctl stats` emits its first statistics record and then stalls; the
+  streaming and capture paths are unaffected. The power standard deviation and
+  maximum also read exactly zero, which is not yet explained.
+- The `u4` and `u1` run-length decoders are implemented to spec but no firmware
+  emits those streams compressed, so they are covered by unit tests only.
 
-Two warnings for anyone continuing this:
+### A warning for anyone measuring this
 
-- **The device's state drifts across sessions, which silently invalidates A/B
-  testing.** Two consecutive six-run trials of one binary gave 1/6 then 0/6.
-  Compare against the official driver in the same sitting, or the measurement
-  is meaningless.
-- A run that reports a high row rate is not necessarily working. The aligner
-  fills gaps with NaN, so a dead stream can still produce rows. Check the
-  reported bulk IN throughput, which is measured at the USB layer: 7.75 MiB/s
-  is real, anything near zero is not.
-
-The next step is a USB-level capture of both drivers' open sequences, diffed at
-the packet layer. The pub/sub sequences are already known to match, so the
-difference lies below them.
-
-**Implemented to spec but not exercised by any firmware:** the `u4` and `u1`
-run-length decoders for the current-range and GPI streams. Current firmware
-ships those uncompressed — the reference driver notes the same — so they are
-covered by unit tests against the documented format only.
+A high row rate does not mean it is working. The aligner fills gaps with NaN,
+so a dead stream can still produce rows at the requested rate — this reported a
+confident "100.08%" from 2,265,732 synthesized samples against 2,520 real ones.
+`jsctl bench` now reports the rate from real samples only. Trust that and the
+bulk IN throughput, not the row count.
 
 ## Scope
 

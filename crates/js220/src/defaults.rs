@@ -10,11 +10,7 @@
 //! This table was captured from the reference driver's own debug log while it
 //! opened a JS220, so it is the sequence a known-working host actually sends,
 //! in order, rather than a reading of the documentation.
-//!
-//! It is **not currently applied**. Wiring it into `open` was tried and made
-//! streaming strictly worse — never starting, where the simpler path starts
-//! roughly one run in four — so it is kept here as verified reference data for
-//! whoever closes out the startup defect, not as live behaviour.
+
 
 use js220_proto::value::Value;
 

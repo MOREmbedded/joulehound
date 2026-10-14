@@ -618,6 +618,12 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     }
 
     let before = *dev.counters();
+    // Snapshot per-signal counters too: they accumulate from stream_start, so
+    // only the delta over the measured window is a rate.
+    let samples_before: Vec<u64> = signals
+        .iter()
+        .map(|s| dev.signal_counters(*s).map_or(0, |c| c.samples))
+        .collect();
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(args.duration);
     let mut rows_total: u64 = 0;
@@ -651,9 +657,35 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         "aligned rows        {rows_total} ({:.0}/s, requested {rate}/s)",
         rows_total as f64 / elapsed
     );
+
+    // Rate is reported from samples the device actually sent, never from row
+    // count. The aligner fills gaps with NaN, so rows alone will happily
+    // report a healthy rate for a stream that has stopped dead.
+    // Only signals the device actually streams have counters. Power is
+    // computed on the host, so including it here would make `min` zero and
+    // report a perfectly healthy capture as having produced nothing.
+    let real: u64 = signals
+        .iter()
+        .zip(&samples_before)
+        .filter_map(|(s, before)| {
+            dev.signal_counters(*s)
+                .map(|c| c.samples.saturating_sub(*before))
+        })
+        .min()
+        .unwrap_or(0);
+    let filled: u64 = signals
+        .iter()
+        .filter_map(|s| dev.signal_counters(*s))
+        .map(|c| c.filled)
+        .max()
+        .unwrap_or(0);
+    println!(
+        "real samples        {real} ({:.0}/s), {filled} synthesized over gaps",
+        real as f64 / elapsed
+    );
     if rate > 0 {
-        let achieved = rows_total as f64 / elapsed / rate as f64 * 100.0;
-        println!("rate achieved       {achieved:.2}% of requested");
+        let achieved = real as f64 / elapsed / rate as f64 * 100.0;
+        println!("rate achieved       {achieved:.2}% of requested (real samples)");
     }
     report_health(&after, &dev, &signals, elapsed);
     Ok(())

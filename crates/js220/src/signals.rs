@@ -12,6 +12,8 @@
 
 use js220_proto::stream::SampleIdUnwrap;
 
+use crate::decimate::Decimator;
+
 /// The three aligned analog signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Signal {
@@ -78,14 +80,32 @@ pub struct SignalCounters {
     pub discontinuities: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Channel {
     data: Vec<f32>,
     unwrap: SampleIdUnwrap,
+    /// Averages input samples down to the requested output rate.
+    decimator: Decimator,
+    /// Scratch for decimator output, reused to avoid per-frame allocation.
+    scratch: Vec<f32>,
     /// Sample id the next appended sample will carry.
     next_id: u64,
     primed: bool,
     counters: SignalCounters,
+}
+
+impl Channel {
+    fn new(decimator: Decimator) -> Self {
+        Self {
+            data: Vec::new(),
+            unwrap: SampleIdUnwrap::new(),
+            decimator,
+            scratch: Vec::new(),
+            next_id: 0,
+            primed: false,
+            counters: SignalCounters::default(),
+        }
+    }
 }
 
 /// Accumulates the analog signals onto a shared timeline.
@@ -115,9 +135,21 @@ impl SignalGroup {
     /// memory. A gap larger than this is treated as a discontinuity: the
     /// timeline re-anchors on the new sample id instead.
     pub fn new(enabled: &[Signal], decimate: u32, max_fill: usize) -> Self {
+        Self::with_decimation(enabled, decimate, max_fill, 1, 1)
+    }
+
+    /// Create a group that averages `factor` input samples, which arrive
+    /// `input_step` sample ids apart, into each output sample.
+    pub fn with_decimation(
+        enabled: &[Signal],
+        decimate: u32,
+        max_fill: usize,
+        factor: u32,
+        input_step: u32,
+    ) -> Self {
         let mut channels: [Option<Channel>; 3] = [None, None, None];
         for s in enabled {
-            channels[s.index()] = Some(Channel::default());
+            channels[s.index()] = Some(Channel::new(Decimator::new(factor, input_step)));
         }
         Self {
             channels,
@@ -175,26 +207,74 @@ impl SignalGroup {
     /// internally. Samples that repeat already-delivered data are dropped, and
     /// a forward jump is covered with NaN so alignment is preserved.
     pub fn push(&mut self, signal: Signal, raw_id: u32, samples: &[f32]) {
-        let decimate = self.decimate as u64;
         let index = signal.index();
-        let Some(channel) = self.channels[index].as_mut() else {
+        if self.channels[index].is_none() {
             return;
+        }
+
+        // The scratch buffer is moved out so the decimated slice borrows a
+        // local rather than `self`, leaving the channel free to be borrowed
+        // mutably while the samples are in hand.
+        let mut scratch = core::mem::take(
+            &mut self.channels[index]
+                .as_mut()
+                .expect("presence checked above")
+                .scratch,
+        );
+        scratch.clear();
+
+        let (emitted, passthrough) = {
+            let channel = self.channels[index].as_mut().expect("presence checked above");
+            let raw_sample_id = channel.unwrap.update(raw_id);
+            if channel.decimator.is_passthrough() {
+                (Some(raw_sample_id), true)
+            } else {
+                // Average down to the output rate first, so the alignment below
+                // works entirely in output samples. Buckets are keyed by
+                // absolute sample id, so every signal lands on the same
+                // boundaries.
+                let emitted = channel
+                    .decimator
+                    .process(raw_sample_id, samples, &mut scratch);
+                (emitted, false)
+            }
         };
-        let id = channel.unwrap.update(raw_id);
+
+        if let Some(id) = emitted {
+            let decimated: &[f32] = if passthrough { samples } else { &scratch };
+            self.push_aligned(index, signal, id, decimated);
+        }
+
+        self.channels[index]
+            .as_mut()
+            .expect("presence checked above")
+            .scratch = scratch;
+    }
+
+    /// Place already-decimated `samples`, starting at output sample id `id`,
+    /// onto the shared timeline.
+    fn push_aligned(&mut self, index: usize, signal: Signal, id: u64, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let decimate = self.decimate as u64;
 
         // The first frame on any channel anchors the whole group's timeline.
         let base = *self.base.get_or_insert(id);
 
-        if !channel.primed {
-            channel.primed = true;
-            channel.next_id = base;
+        {
+            let channel = self.channels[index].as_mut().expect("caller checked");
+            if !channel.primed {
+                channel.primed = true;
+                channel.next_id = base;
+            }
         }
 
         // A gap far larger than any real dropout means the timeline no longer
         // relates to what the device is sending — a frame left over from a
         // previous session, or a counter that jumped. Re-anchor rather than
         // synthesizing millions of samples to bridge it.
-        let next_id = channel.next_id;
+        let next_id = self.channels[index].as_ref().expect("caller checked").next_id;
         if id > next_id && (id - next_id) / decimate > self.max_fill as u64 {
             log::debug!(
                 "{} sample id jumped from {next_id} to {id}; re-anchoring",
@@ -203,10 +283,7 @@ impl SignalGroup {
             self.resync(id);
         }
 
-        let Some(channel) = self.channels[index].as_mut() else {
-            return;
-        };
-
+        let channel = self.channels[index].as_mut().expect("caller checked");
         let mut samples = samples;
         let mut write_id = id;
 
@@ -276,6 +353,8 @@ impl SignalGroup {
         for channel in self.channels.iter_mut().flatten() {
             channel.data.clear();
             channel.unwrap.reset();
+            channel.decimator.reset();
+            channel.scratch.clear();
             channel.primed = false;
             channel.next_id = 0;
         }
