@@ -41,6 +41,10 @@ enum Command {
     List,
     /// Open a device and report its versions and settings.
     Info(DeviceArgs),
+    /// Print the device's own topic tree: types, defaults and option tables.
+    Topics(TopicsArgs),
+    /// Issue a USB reset, recovering a device left in a bad state.
+    Reset(DeviceArgs),
     /// Print on-instrument statistics as they arrive.
     Stats(StatsArgs),
     /// Stream samples to a file.
@@ -158,6 +162,20 @@ impl StreamArgs {
 }
 
 #[derive(Args)]
+struct TopicsArgs {
+    #[command(flatten)]
+    device: DeviceArgs,
+
+    /// Only show topics containing this text.
+    #[arg(short, long, value_name = "SUBSTRING")]
+    filter: Option<String>,
+
+    /// Print the raw metadata JSON instead of a summary.
+    #[arg(long)]
+    raw: bool,
+}
+
+#[derive(Args)]
 struct StatsArgs {
     #[command(flatten)]
     device: DeviceArgs,
@@ -216,6 +234,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::List => cmd_list(),
         Command::Info(args) => cmd_info(&args),
+        Command::Topics(args) => cmd_topics(&args),
+        Command::Reset(args) => cmd_reset(&args),
         Command::Stats(args) => cmd_stats(&args),
         Command::Capture(args) => cmd_capture(&args),
         Command::Bench(args) => cmd_bench(&args),
@@ -263,15 +283,25 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
+fn cmd_reset(args: &DeviceArgs) -> Result<()> {
+    let info = js220::find(args.serial.as_deref()).context("finding the device")?;
+    eprintln!("resetting {} ...", info.serial());
+    js220::usb::reset(&info).context("resetting the device")?;
+    // The device re-enumerates, so it is briefly absent from the bus.
+    std::thread::sleep(Duration::from_millis(2000));
+    match js220::find(args.serial.as_deref()) {
+        Ok(d) => println!("{} is back", d.serial()),
+        Err(e) => println!("device has not reappeared yet ({e}); give it a moment"),
+    }
+    Ok(())
+}
+
 fn cmd_info(args: &DeviceArgs) -> Result<()> {
     let mut dev = args.open()?;
 
     // Give the device a moment to publish its retained topic values.
     dev.request_values().context("requesting device values")?;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < deadline {
-        dev.poll(Duration::from_millis(50))?;
-    }
+    dev.drain(Duration::from_millis(1000));
 
     let info = dev.connect_info();
     println!("serial            {}", dev.serial());
@@ -298,6 +328,90 @@ fn cmd_info(args: &DeviceArgs) -> Result<()> {
             println!("  {:<28} {:?}", t, params[t]);
         }
     }
+    Ok(())
+}
+
+/// Render one metadata document as a compact summary line.
+///
+/// The instrument describes every topic itself — type, default, and the option
+/// table for enumerated values. Reading it from the device beats hardcoding
+/// guesses: the current-range select topic, for instance, turns out to be a
+/// bitmap rather than the plain index its documentation suggests.
+fn summarize_metadata(json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return json.replace('\n', " ");
+    };
+    let mut parts = Vec::new();
+    if let Some(d) = v.get("dtype").and_then(|d| d.as_str()) {
+        parts.push(format!("{d:<6}"));
+    }
+    if let Some(b) = v.get("brief").and_then(|b| b.as_str()) {
+        parts.push(b.to_string());
+    }
+    if let Some(opts) = v.get("options").and_then(|o| o.as_array()) {
+        let rendered: Vec<String> = opts
+            .iter()
+            .filter_map(|o| {
+                let pair = o.as_array()?;
+                let value = pair.first()?;
+                let name = pair.get(1).and_then(|n| n.as_str()).unwrap_or("");
+                Some(format!("{value}={name}"))
+            })
+            .collect();
+        if !rendered.is_empty() {
+            parts.push(format!("[{}]", rendered.join(", ")));
+        }
+    }
+    parts.join("  ")
+}
+
+fn cmd_topics(args: &TopicsArgs) -> Result<()> {
+    let mut dev = args.device.open()?;
+
+    // The metadata dump is hundreds of messages, so this is requested only by
+    // the commands that actually need it, and given time to arrive.
+    dev.request_metadata().context("requesting metadata")?;
+    dev.drain(Duration::from_millis(1500));
+    dev.request_values().context("requesting values")?;
+    dev.drain(Duration::from_millis(1000));
+
+    let params = dev.params();
+
+    // Metadata arrives on `topic$`, current values on `topic?`.
+    let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+    for (topic, value) in params {
+        let Some(base) = topic.strip_suffix('$') else {
+            continue;
+        };
+        if let Some(f) = &args.filter {
+            if !base.contains(f.as_str()) {
+                continue;
+            }
+        }
+        let Some(json) = value.as_str() else { continue };
+        let current = params
+            .get(&format!("{base}?"))
+            .map(|v| format!("{v:?}"));
+        let described = if args.raw {
+            json.replace('\n', " ")
+        } else {
+            summarize_metadata(json)
+        };
+        rows.push((base.to_string(), described, current));
+    }
+    rows.sort();
+
+    if rows.is_empty() {
+        println!("No matching topics. The device publishes metadata on connect; try without --filter.");
+        return Ok(());
+    }
+    for (topic, described, current) in &rows {
+        match current {
+            Some(c) => println!("{topic:<28} = {c:<12} {described}"),
+            None => println!("{topic:<28} {:<15} {described}", ""),
+        }
+    }
+    println!("\n{} topics", rows.len());
     Ok(())
 }
 

@@ -120,6 +120,26 @@ pub fn find(serial: Option<&str>) -> Result<DeviceInfo> {
     }
 }
 
+/// Issue a USB port reset to the device.
+///
+/// This is the software equivalent of unplugging and replugging it. Use it when
+/// a device has been left in a bad state by an interrupted session: the
+/// instrument keeps streaming configuration across a mere disconnect, so a
+/// reset is sometimes the only way back to a known state without physical
+/// access.
+///
+/// The device re-enumerates afterwards and may briefly disappear, so give it a
+/// moment before opening it again.
+pub fn reset(info: &DeviceInfo) -> Result<()> {
+    let device = info
+        .raw()
+        .open()
+        .wait()
+        .usb_context("opening device for reset")?;
+    device.reset().wait().usb_context("resetting device")?;
+    Ok(())
+}
+
 /// Tuning for the bulk IN pipeline.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportConfig {

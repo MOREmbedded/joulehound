@@ -96,6 +96,10 @@ pub struct SignalGroup {
     base: Option<u64>,
     /// Sample id increment between consecutive samples.
     decimate: u32,
+    /// Largest gap that will be bridged with NaN before the group re-anchors.
+    max_fill: usize,
+    /// Times the group re-anchored because a gap exceeded `max_fill`.
+    resyncs: u64,
 }
 
 impl SignalGroup {
@@ -104,7 +108,13 @@ impl SignalGroup {
     ///
     /// `decimate` of zero is treated as one so a misconfigured rate cannot
     /// cause a division by zero on the hot path.
-    pub fn new(enabled: &[Signal], decimate: u32) -> Self {
+    ///
+    /// `max_fill` bounds how many samples will be synthesized to bridge a gap.
+    /// The fill count comes from sample ids the device reports, so leaving it
+    /// unbounded lets one stale or corrupt frame allocate arbitrarily much
+    /// memory. A gap larger than this is treated as a discontinuity: the
+    /// timeline re-anchors on the new sample id instead.
+    pub fn new(enabled: &[Signal], decimate: u32, max_fill: usize) -> Self {
         let mut channels: [Option<Channel>; 3] = [None, None, None];
         for s in enabled {
             channels[s.index()] = Some(Channel::default());
@@ -113,7 +123,26 @@ impl SignalGroup {
             channels,
             base: None,
             decimate: decimate.max(1),
+            max_fill,
+            resyncs: 0,
         }
+    }
+
+    /// How many times the timeline re-anchored after an oversized gap.
+    pub fn resyncs(&self) -> u64 {
+        self.resyncs
+    }
+
+    /// Drop all buffered data and re-anchor the shared timeline at `id`.
+    fn resync(&mut self, id: u64) {
+        for channel in self.channels.iter_mut().flatten() {
+            channel.data.clear();
+            channel.next_id = id;
+            channel.primed = true;
+            channel.counters.discontinuities += 1;
+        }
+        self.base = Some(id);
+        self.resyncs += 1;
     }
 
     /// The signals this group is accumulating.
@@ -147,7 +176,8 @@ impl SignalGroup {
     /// a forward jump is covered with NaN so alignment is preserved.
     pub fn push(&mut self, signal: Signal, raw_id: u32, samples: &[f32]) {
         let decimate = self.decimate as u64;
-        let Some(channel) = self.channels[signal.index()].as_mut() else {
+        let index = signal.index();
+        let Some(channel) = self.channels[index].as_mut() else {
             return;
         };
         let id = channel.unwrap.update(raw_id);
@@ -159,6 +189,23 @@ impl SignalGroup {
             channel.primed = true;
             channel.next_id = base;
         }
+
+        // A gap far larger than any real dropout means the timeline no longer
+        // relates to what the device is sending — a frame left over from a
+        // previous session, or a counter that jumped. Re-anchor rather than
+        // synthesizing millions of samples to bridge it.
+        let next_id = channel.next_id;
+        if id > next_id && (id - next_id) / decimate > self.max_fill as u64 {
+            log::debug!(
+                "{} sample id jumped from {next_id} to {id}; re-anchoring",
+                signal.name()
+            );
+            self.resync(id);
+        }
+
+        let Some(channel) = self.channels[index].as_mut() else {
+            return;
+        };
 
         let mut samples = samples;
         let mut write_id = id;
@@ -241,9 +288,10 @@ mod tests {
     use super::*;
 
     const D: u32 = 2; // 1 Msps: two sample ids per sample
+    const MAX_FILL: usize = 1000;
 
     fn group() -> SignalGroup {
-        SignalGroup::new(&[Signal::Current, Signal::Voltage], D)
+        SignalGroup::new(&[Signal::Current, Signal::Voltage], D, MAX_FILL)
     }
 
     #[test]
@@ -363,7 +411,7 @@ mod tests {
 
     #[test]
     fn sample_ids_are_widened_across_the_wrap() {
-        let mut g = SignalGroup::new(&[Signal::Current], D);
+        let mut g = SignalGroup::new(&[Signal::Current], D, MAX_FILL);
         g.push(Signal::Current, 0xffff_fffc, &[1.0, 2.0]);
         // Wraps to 0; two samples at decimate 2 is exactly the next id.
         g.push(Signal::Current, 0x0000_0000, &[3.0]);
@@ -373,7 +421,7 @@ mod tests {
 
     #[test]
     fn disabled_signals_are_ignored_on_push() {
-        let mut g = SignalGroup::new(&[Signal::Current], D);
+        let mut g = SignalGroup::new(&[Signal::Current], D, MAX_FILL);
         g.push(Signal::Power, 0, &[1.0]);
         assert!(g.buffered(Signal::Power).is_empty());
         assert!(g.counters(Signal::Power).is_none());
@@ -381,13 +429,13 @@ mod tests {
 
     #[test]
     fn an_empty_group_is_never_ready() {
-        let g = SignalGroup::new(&[], D);
+        let g = SignalGroup::new(&[], D, MAX_FILL);
         assert_eq!(g.ready(), 0);
     }
 
     #[test]
     fn enabled_lists_only_configured_signals() {
-        let g = SignalGroup::new(&[Signal::Power, Signal::Current], D);
+        let g = SignalGroup::new(&[Signal::Power, Signal::Current], D, MAX_FILL);
         let got: Vec<_> = g.enabled().collect();
         assert_eq!(got, vec![Signal::Current, Signal::Power]);
     }
@@ -409,8 +457,57 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_gap_re_anchors_instead_of_filling() {
+        let mut g = group();
+        g.push(Signal::Current, 0, &[1.0, 2.0]);
+        g.push(Signal::Voltage, 0, &[3.0, 4.0]);
+
+        // Jump far beyond max_fill, as a stale frame from an earlier session
+        // or a corrupt sample id would.
+        let far = (MAX_FILL as u32 + 10_000) * D;
+        g.push(Signal::Current, far, &[9.0]);
+
+        assert_eq!(g.resyncs(), 1);
+        assert_eq!(g.base_sample_id(), Some(far as u64));
+        assert_eq!(
+            g.buffered(Signal::Current),
+            [9.0],
+            "only the new frame survives the re-anchor"
+        );
+        assert!(g.buffered(Signal::Voltage).is_empty());
+        assert!(
+            g.counters(Signal::Current).unwrap().filled < MAX_FILL as u64,
+            "must not synthesize the whole gap"
+        );
+    }
+
+    #[test]
+    fn a_gap_within_the_limit_is_still_filled() {
+        let mut g = group();
+        g.push(Signal::Current, 0, &[1.0]);
+        let within = 100 * D;
+        g.push(Signal::Current, within, &[2.0]);
+        assert_eq!(g.resyncs(), 0);
+        assert_eq!(g.buffered(Signal::Current).len(), 101);
+        assert_eq!(g.counters(Signal::Current).unwrap().filled, 99);
+    }
+
+    #[test]
+    fn re_anchoring_keeps_every_channel_on_one_timeline() {
+        let mut g = group();
+        g.push(Signal::Current, 0, &[1.0]);
+        g.push(Signal::Voltage, 0, &[2.0]);
+        let far = (MAX_FILL as u32 + 50) * D;
+        g.push(Signal::Current, far, &[7.0]);
+        g.push(Signal::Voltage, far, &[8.0]);
+        assert_eq!(g.ready(), 1);
+        assert_eq!(g.buffered(Signal::Current), [7.0]);
+        assert_eq!(g.buffered(Signal::Voltage), [8.0]);
+    }
+
+    #[test]
     fn zero_decimation_is_clamped_to_one() {
-        let g = SignalGroup::new(&[Signal::Current], 0);
+        let g = SignalGroup::new(&[Signal::Current], 0, MAX_FILL);
         assert_eq!(g.decimate(), 1);
     }
 

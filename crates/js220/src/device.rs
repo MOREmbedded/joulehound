@@ -23,6 +23,55 @@ pub const MAX_SAMPLE_RATE: u32 = 1_000_000;
 /// Lowest rate the instrument can decimate to on its own.
 pub const MIN_SAMPLE_RATE: u32 = 1_000;
 
+/// How long to let the device settle after a state change before trusting what
+/// arrives to belong to the new state.
+const SETTLE: Duration = Duration::from_millis(250);
+
+// Range enumerations, taken from the options tables the instrument publishes in
+// its own metadata. Run `jsctl topics` to print them from a live device.
+
+/// `s/i/range/mode` value for auto-ranging.
+const RANGE_MODE_AUTO: u8 = 4;
+/// `s/i/range/mode` value for a host-selected fixed range.
+const RANGE_MODE_MANUAL: u8 = 5;
+/// `s/i/range/mode` value disabling range switching.
+const RANGE_MODE_OFF: u8 = 0;
+
+/// Convert a current range index to the instrument's select bitmap.
+///
+/// `s/i/range/select` is a bitmap, not an index: bit 7 enables manual
+/// selection and one of bits 0..=5 picks the range. Index 0 is the 10 A range
+/// and index 5 is the 18 µA range, so larger indices are *more* sensitive.
+const fn current_range_select(index: u8) -> u8 {
+    0x80 | (1 << index)
+}
+
+/// `s/v/range/mode` value for auto-ranging.
+const V_RANGE_MODE_AUTO: u8 = 0;
+/// `s/v/range/mode` value for a host-selected fixed range.
+///
+/// The voltage range mode is a different enumeration from the current range
+/// mode: it is simply `0=auto, 1=manual`.
+const V_RANGE_MODE_MANUAL: u8 = 1;
+/// Voltage range selector for the 2 V range.
+const V_RANGE_2V: u8 = 1;
+/// Voltage range selector for the 15 V range.
+const V_RANGE_15V: u8 = 0;
+
+/// Pick a starting ping value unlikely to collide with a previous session's.
+///
+/// Only the low byte survives the device's round trip, so the seed has to fit
+/// in a `u8`. That is a small space, but it still makes accepting a stale pong
+/// from an earlier process unlikely rather than near-certain, which a fixed
+/// start of 1 made it.
+fn session_ping_seed() -> u8 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.subsec_nanos());
+    (nanos % 251) as u8 + 1
+}
+
 /// Current range selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CurrentRange {
@@ -198,6 +247,9 @@ pub struct Js220 {
     config: Option<StreamConfig>,
     params: HashMap<String, Value>,
     statistics: Option<Statistics>,
+    /// Low byte of the most recent pong, used as a round-trip barrier.
+    last_pong: Option<u8>,
+    next_ping: u8,
     time_map: TimeMap,
     counters: Counters,
     expect_frame_id: Option<u16>,
@@ -244,19 +296,80 @@ impl Js220 {
             link,
             serial: info.serial().to_owned(),
             connect_info: ConnectInfo::default(),
-            group: SignalGroup::new(&[], 2),
+            group: SignalGroup::new(&[], 2, MAX_SAMPLE_RATE as usize),
             power: Vec::new(),
             scratch: Vec::new(),
             config: None,
             params: HashMap::new(),
             statistics: None,
+            last_pong: None,
+            // Seeded per session rather than from a fixed value. The device
+            // can still have pongs queued from a previous process, and a
+            // counter that always starts at 1 would accept one of those as the
+            // answer to a ping it never saw.
+            next_ping: session_ping_seed(),
             time_map: TimeMap::new(),
             counters: Counters::default(),
             expect_frame_id: None,
             streaming: false,
         };
         dev.await_connect(Duration::from_millis(3000))?;
+
+        // The instrument is not ready for configuration the instant it
+        // acknowledges the connect: it still has its metadata and retained
+        // values to publish. Walking through that exchange and closing it with
+        // a ping gives a barrier, so a `stream_start` issued immediately after
+        // `open` cannot be dropped on the floor.
+        // Let the device finish its own post-connect chatter before returning.
+        // Requesting the full metadata and value dump here was tried and
+        // removed: those are hundreds of messages, and configuration published
+        // on their heels was being dropped. Commands that need the topic tree
+        // ask for it explicitly instead.
+        dev.drain(SETTLE);
         Ok(dev)
+    }
+
+    /// Poll for `duration`, discarding whatever arrives.
+    ///
+    /// Used to absorb traffic that belongs to the previous state of the device
+    /// rather than to what the caller is about to ask for.
+    pub fn drain(&mut self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            match self.poll(Duration::from_millis(20)) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::debug!("drain stopped: {e}");
+                    return;
+                }
+            }
+        }
+        let n = self.group.ready();
+        self.group.consume(n);
+    }
+
+    /// Round-trip a ping through the device's pub/sub engine.
+    ///
+    /// The device processes messages in order, so a returned pong proves every
+    /// publish issued before it has been applied. This is the only barrier the
+    /// protocol offers; without it a configuration change raced against the
+    /// device's own startup traffic can be silently lost.
+    pub fn ping(&mut self, timeout: Duration) -> Result<()> {
+        let value = self.next_ping;
+        self.next_ping = self.next_ping.wrapping_add(1).max(1);
+        self.last_pong = None;
+        self.publish_raw(js220_proto::pubsub::TOPIC_PING, Value::U32(value as u32))?;
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.poll(Duration::from_millis(50))?;
+            if self.last_pong == Some(value) {
+                return Ok(());
+            }
+        }
+        Err(Error::Timeout {
+            context: "a ping response from the device",
+        })
     }
 
     fn await_connect(&mut self, timeout: Duration) -> Result<()> {
@@ -357,12 +470,15 @@ impl Js220 {
             self.stream_stop()?;
         }
 
+        // Auto-ranging must be requested explicitly. The instrument's own
+        // default for `s/i/range/mode` is 0, which is *off*, and this driver
+        // connects with the reset option, so every session starts with the
+        // current front end not ranging. Leaving these topics alone yields a
+        // link that connects and acknowledges everything while producing no
+        // current samples at all.
         match config.current_range {
             CurrentRange::Auto => {
-                self.publish(
-                    topics::S_CURRENT_RANGE_MODE,
-                    Value::Str(topics::current_range_mode::AUTO.into()),
-                )?;
+                self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_AUTO))?;
             }
             CurrentRange::Manual(n) => {
                 if n > 5 {
@@ -370,38 +486,29 @@ impl Js220 {
                         reason: format!("current range {n} is outside 0..=5"),
                     });
                 }
+                self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_MANUAL))?;
                 self.publish(
-                    topics::S_CURRENT_RANGE_MODE,
-                    Value::Str(topics::current_range_mode::MANUAL.into()),
+                    topics::S_CURRENT_RANGE_SELECT,
+                    Value::U8(current_range_select(n)),
                 )?;
-                self.publish(topics::S_CURRENT_RANGE_SELECT, Value::U32(n as u32))?;
             }
             CurrentRange::Off => {
-                self.publish(
-                    topics::S_CURRENT_RANGE_MODE,
-                    Value::Str(topics::current_range_mode::OFF.into()),
-                )?;
+                self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_OFF))?;
             }
         }
 
         match config.voltage_range {
             VoltageRange::Auto => {
-                self.publish(
-                    topics::S_VOLTAGE_RANGE_MODE,
-                    Value::Str(topics::current_range_mode::AUTO.into()),
-                )?;
+                self.publish(topics::S_VOLTAGE_RANGE_MODE, Value::U8(V_RANGE_MODE_AUTO))?;
             }
             VoltageRange::V2 | VoltageRange::V15 => {
                 let sel = if config.voltage_range == VoltageRange::V2 {
-                    topics::voltage_range::V2
+                    V_RANGE_2V
                 } else {
-                    topics::voltage_range::V15
+                    V_RANGE_15V
                 };
-                self.publish(
-                    topics::S_VOLTAGE_RANGE_MODE,
-                    Value::Str(topics::current_range_mode::MANUAL.into()),
-                )?;
-                self.publish(topics::S_VOLTAGE_RANGE_SELECT, Value::Str(sel.into()))?;
+                self.publish(topics::S_VOLTAGE_RANGE_MODE, Value::U8(V_RANGE_MODE_MANUAL))?;
+                self.publish(topics::S_VOLTAGE_RANGE_SELECT, Value::U8(sel))?;
             }
         }
 
@@ -414,7 +521,10 @@ impl Js220 {
         }
 
         let device_signals = config.device_signals();
-        self.group = SignalGroup::new(&device_signals, config.decimate());
+        // Bridge at most a second of dropout before re-anchoring; a longer gap
+        // is not a dropout, it is a stale or bogus sample id.
+        let max_fill = config.sample_rate as usize;
+        self.group = SignalGroup::new(&device_signals, config.decimate(), max_fill);
         self.power.clear();
         self.scratch.clear();
         self.expect_frame_id = None;
@@ -425,7 +535,9 @@ impl Js220 {
                 Signal::Voltage => topics::S_VOLTAGE_CTRL,
                 Signal::Power => continue,
             };
-            self.publish(topic, Value::U32(1))?;
+            // The instrument declares the ctrl topics as u8; publishing the
+            // type it expects avoids relying on its coercion rules.
+            self.publish(topic, Value::U8(1))?;
         }
 
         if config.statistics {
@@ -433,12 +545,19 @@ impl Js220 {
                 topics::S_STATS_SCNT,
                 Value::U32(config.statistics_block_samples()),
             )?;
-            self.publish(topics::S_STATS_CTRL, Value::U32(1))?;
+            self.publish(topics::S_STATS_CTRL, Value::U8(1))?;
         }
 
         self.link.prime();
         self.config = Some(config);
         self.streaming = true;
+
+        // Give the instrument a moment to apply the settings, then discard
+        // everything received up to this point: it was queued before the
+        // stream was configured, or left over from a previous session. The
+        // caller's first row is then genuinely the first row.
+        self.drain(SETTLE);
+        self.group.reset();
         Ok(())
     }
 
@@ -457,7 +576,7 @@ impl Js220 {
             topics::S_POWER_CTRL,
             topics::S_STATS_CTRL,
         ] {
-            if let Err(e) = self.publish(topic, Value::U32(0)) {
+            if let Err(e) = self.publish(topic, Value::U8(0)) {
                 first_err.get_or_insert(e);
             }
         }
@@ -581,6 +700,12 @@ impl Js220 {
         match PubSubMsg::decode(payload) {
             Ok(msg) => {
                 log::trace!("pubsub {} = {:?}", msg.topic, msg.value);
+                if msg.topic == js220_proto::pubsub::TOPIC_PONG {
+                    // Compared narrowly: the device echoes the ping through a
+                    // narrower field than it was published in, so only the low
+                    // byte reliably survives the round trip.
+                    self.last_pong = msg.value.as_i64().map(|v| v as u8);
+                }
                 self.params.insert(msg.topic, msg.value);
             }
             Err(e) => log::debug!("pubsub decode failed: {e}"),
