@@ -1,7 +1,21 @@
 [package]
 name = "jsctl"
+description = "Command line tool for the Joulescope JS220"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "jsctl"
+path = "src/main.rs"
 
 [dependencies]
+js220 = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+ctrlc = "3"
+env_logger = "0.11"
+log = "0.4"
