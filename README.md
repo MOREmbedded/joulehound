@@ -13,7 +13,10 @@ crates/
   js220-proto   wire protocol codec — no I/O, no threads, no device handles
   js220         USB transport and device session
   jsctl         command line tool
+  jsgui         live GUI: plots, markers, measurements, recording
 ```
+
+![jsgui](docs/jsgui.png)
 
 ## Status
 
@@ -69,6 +72,40 @@ current, voltage, power = rows[:, 0], rows[:, 1], rows[:, 2]
 `--format csv` writes a header plus `sample_id`, `time_s` and one column per
 signal. It is far slower and much larger; use it for small captures and quick
 inspection.
+
+## The GUI
+
+```bash
+jsgui           # pick a device and press Start
+jsgui --start   # begin streaming immediately
+```
+
+Three stacked plots share a time axis: current, voltage and power. Each is
+drawn as a **min/max envelope with the mean overlaid**, so a single-sample
+spike is still visible when one pixel column covers thousands of samples —
+which a plain decimated plot would hide entirely.
+
+**Scaling.** Both axes pan and zoom at any time: drag to pan, wheel to zoom.
+Each plot has its own *Follow* toggle, which keeps the newest data in view and
+auto-scales Y to what is actually on screen. Taking hold of a plot turns Follow
+off for that plot alone, so the view never fights you; *Fit* resumes it. The
+toolbar's window selector chooses how much history is shown while following,
+and *Auto-fit* resumes following everywhere.
+
+**Markers.** *Set A* and *Set B* place two markers, which appear at the same
+time position in all three plots. The panel then reports, per signal, the value
+at A, the value at B, the difference, the mean between them, and the minimum,
+maximum and peak-to-peak over the span — plus Δt, 1/Δt, and the charge and
+energy accumulated between the markers. The *↔A* and *↔B* buttons arm a marker
+so clicking or dragging in a plot repositions it.
+
+**Recording** writes the same interleaved little-endian `f32` format `jsctl`
+produces, so the two are interchangeable.
+
+The acquisition thread owns the device and never blocks on rendering: a host
+that stops draining the bulk IN queue makes the *device* drop samples silently.
+Samples are folded into display buckets as they arrive, so the GUI only ever
+handles a few thousand points per signal no matter the sample rate.
 
 ## Design
 

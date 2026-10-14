@@ -5,3 +5,7 @@
 *.jsraw
 *.jsbin
 /captures
+
+# screenshots captured during development
+/shot*.png
+/toolbar.png

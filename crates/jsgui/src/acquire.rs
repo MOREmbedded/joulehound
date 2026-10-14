@@ -1,0 +1,605 @@
+//! The acquisition thread.
+//!
+//! The GUI must never block on USB, and the USB loop must never block on
+//! rendering: if the host stops draining the bulk IN queue the device drops
+//! samples silently. So acquisition owns the device on its own thread and the
+//! two communicate only through a command channel and a shared snapshot.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use js220::proto::stats::Statistics;
+use js220::{Js220, Signal, StreamConfig, TransportConfig};
+
+use crate::buffer::SignalTrace;
+
+/// How long a single poll blocks before the loop checks for commands.
+const POLL: Duration = Duration::from_millis(50);
+
+/// Maximum log lines retained.
+const LOG_LIMIT: usize = 400;
+
+/// Display buckets retained per signal, roughly one per horizontal pixel of a
+/// wide window with room to scroll back.
+pub const BUCKETS: usize = 4000;
+
+/// Seconds of history the traces aim to cover.
+pub const WINDOW_SECONDS: f64 = 10.0;
+
+/// Commands the GUI sends to the acquisition thread.
+#[derive(Debug, Clone)]
+pub enum Command {
+    /// Open a device and begin streaming.
+    Start {
+        /// Serial number, or `None` for the first device found.
+        serial: Option<String>,
+        /// Requested output sample rate in Hz.
+        rate: u32,
+        /// Enable the on-instrument statistics stream.
+        statistics: bool,
+    },
+    /// Stop streaming and close the device.
+    Stop,
+    /// Discard the displayed history.
+    ClearTraces,
+    /// Begin writing samples to `path`.
+    RecordStart {
+        /// Destination file.
+        path: std::path::PathBuf,
+    },
+    /// Stop writing samples.
+    RecordStop,
+    /// Shut the thread down.
+    Quit,
+}
+
+/// Connection state, as the GUI should display it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// No device open.
+    Idle,
+    /// Opening and configuring.
+    Connecting,
+    /// Streaming.
+    Running,
+    /// Stopped after an error.
+    Failed(String),
+}
+
+impl Status {
+    /// Short label for display.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Idle => "idle",
+            Self::Connecting => "connecting",
+            Self::Running => "running",
+            Self::Failed(_) => "error",
+        }
+    }
+}
+
+/// Everything the GUI reads to draw a frame.
+#[derive(Debug)]
+pub struct Shared {
+    /// Current connection state.
+    pub status: Status,
+    /// Device serial number once known.
+    pub serial: Option<String>,
+    /// Firmware, hardware and FPGA versions, formatted for display.
+    pub versions: Option<String>,
+    /// Aggregated current trace, in amperes.
+    pub current: SignalTrace,
+    /// Aggregated voltage trace, in volts.
+    pub voltage: SignalTrace,
+    /// Aggregated power trace, in watts.
+    pub power: SignalTrace,
+    /// Most recent on-instrument statistics.
+    pub statistics: Option<Statistics>,
+    /// Sustained bulk IN rate in bytes per second.
+    pub throughput: f64,
+    /// Samples delivered per second, measured from real samples.
+    pub sample_rate: f64,
+    /// Total samples received this session.
+    pub samples: u64,
+    /// Samples synthesized to bridge gaps.
+    pub filled: u64,
+    /// Frames that failed to decode.
+    pub frame_errors: u64,
+    /// Breaks in the device's frame sequence.
+    pub frame_breaks: u64,
+    /// Seconds of data captured.
+    pub elapsed: f64,
+    /// Rows written to the recording, if one is active.
+    pub recorded_rows: u64,
+    /// Path being recorded to.
+    pub recording: Option<std::path::PathBuf>,
+    /// Rolling log, oldest first.
+    pub log: Vec<LogLine>,
+    /// Seconds covered by one display bucket.
+    pub bucket_seconds: f64,
+}
+
+/// One line in the GUI log pane.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    /// Seconds since the GUI started.
+    pub t: f64,
+    /// Severity, for colouring.
+    pub level: LogLevel,
+    /// Message text.
+    pub text: String,
+}
+
+/// Log severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// Routine progress.
+    Info,
+    /// Something degraded but recoverable.
+    Warn,
+    /// An operation failed.
+    Error,
+}
+
+impl Shared {
+    /// Create an empty snapshot holding `buckets` display buckets per signal.
+    pub fn new(buckets: usize) -> Self {
+        Self {
+            status: Status::Idle,
+            serial: None,
+            versions: None,
+            current: SignalTrace::new(buckets),
+            voltage: SignalTrace::new(buckets),
+            power: SignalTrace::new(buckets),
+            statistics: None,
+            throughput: 0.0,
+            sample_rate: 0.0,
+            samples: 0,
+            filled: 0,
+            frame_errors: 0,
+            frame_breaks: 0,
+            elapsed: 0.0,
+            recorded_rows: 0,
+            recording: None,
+            log: Vec::new(),
+            bucket_seconds: 0.001,
+        }
+    }
+
+    fn push_log(&mut self, level: LogLevel, text: impl Into<String>, started: Instant) {
+        self.log.push(LogLine {
+            t: started.elapsed().as_secs_f64(),
+            level,
+            text: text.into(),
+        });
+        if self.log.len() > LOG_LIMIT {
+            let excess = self.log.len() - LOG_LIMIT;
+            self.log.drain(..excess);
+        }
+    }
+
+    fn clear_traces(&mut self) {
+        self.current.clear();
+        self.voltage.clear();
+        self.power.clear();
+    }
+}
+
+/// Handle the GUI holds on the acquisition thread.
+pub struct Acquisition {
+    tx: Sender<Command>,
+    shared: Arc<Mutex<Shared>>,
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Acquisition {
+    /// Spawn the acquisition thread.
+    pub fn spawn(buckets: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(Mutex::new(Shared::new(buckets)));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let worker_shared = Arc::clone(&shared);
+        let worker_running = Arc::clone(&running);
+        let handle = std::thread::Builder::new()
+            .name("js220-acquire".into())
+            .spawn(move || run(rx, worker_shared, worker_running))
+            .expect("spawning the acquisition thread");
+
+        Self {
+            tx,
+            shared,
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    /// Send a command, ignoring failure if the thread has already exited.
+    pub fn send(&self, command: Command) {
+        let _ = self.tx.send(command);
+    }
+
+    /// Borrow the shared snapshot.
+    pub fn shared(&self) -> &Arc<Mutex<Shared>> {
+        &self.shared
+    }
+}
+
+impl Drop for Acquisition {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        let _ = self.tx.send(Command::Quit);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Per-session state while a device is open.
+struct Session {
+    device: Js220,
+    rate: u32,
+    sample_period: f64,
+    /// Index of the next sample, counted from capture start.
+    next_index: u64,
+    started: Instant,
+    last_stats: Instant,
+    last_bytes: u64,
+    last_samples: u64,
+    recorder: Option<Recorder>,
+}
+
+struct Recorder {
+    writer: std::io::BufWriter<std::fs::File>,
+    rows: u64,
+    path: std::path::PathBuf,
+}
+
+fn run(rx: Receiver<Command>, shared: Arc<Mutex<Shared>>, running: Arc<AtomicBool>) {
+    let started = Instant::now();
+    let mut session: Option<Session> = None;
+
+    while running.load(Ordering::Relaxed) {
+        // Commands first, so a stop request is honoured promptly.
+        loop {
+            match rx.try_recv() {
+                // `session` is dropped on return, which closes the device.
+                Ok(Command::Quit) => return,
+                Ok(cmd) => handle_command(cmd, &mut session, &shared, started),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        let Some(active) = session.as_mut() else {
+            // Nothing to do; sleep briefly rather than spin.
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+
+        if let Err(e) = pump(active, &shared, started) {
+            {
+                let mut s = shared.lock().expect("shared snapshot poisoned");
+                s.push_log(LogLevel::Error, format!("streaming stopped: {e}"), started);
+                s.status = Status::Failed(e.to_string());
+            }
+            // Closing the device here also stops the instrument streaming.
+            session = None;
+            continue;
+        }
+    }
+}
+
+fn handle_command(
+    cmd: Command,
+    session: &mut Option<Session>,
+    shared: &Arc<Mutex<Shared>>,
+    started: Instant,
+) {
+    match cmd {
+        Command::Start {
+            serial,
+            rate,
+            statistics,
+        } => {
+            {
+                let mut s = shared.lock().expect("shared snapshot poisoned");
+                s.status = Status::Connecting;
+                s.push_log(LogLevel::Info, "opening device", started);
+                s.clear_traces();
+                s.samples = 0;
+                s.filled = 0;
+                s.elapsed = 0.0;
+            }
+            match start_session(serial.as_deref(), rate, statistics) {
+                Ok(new) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.serial = Some(new.device.serial().to_owned());
+                    let info = new.device.connect_info();
+                    s.versions = Some(format!(
+                        "fw {} · hw {} · fpga {}",
+                        info.fw_version, info.hw_version, info.fpga_version
+                    ));
+                    // One bucket per pixel column is plenty; tie it to the
+                    // rate so the window covers a sensible span at any rate.
+                    s.bucket_seconds = bucket_seconds_for(rate);
+                    s.status = Status::Running;
+                    s.push_log(LogLevel::Info, format!("streaming at {rate} Hz"), started);
+                    *session = Some(new);
+                }
+                Err(e) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.push_log(LogLevel::Error, format!("open failed: {e}"), started);
+                    s.status = Status::Failed(e.to_string());
+                }
+            }
+        }
+        Command::Stop => {
+            *session = None;
+            let mut s = shared.lock().expect("shared snapshot poisoned");
+            s.status = Status::Idle;
+            s.recording = None;
+            s.push_log(LogLevel::Info, "stopped", started);
+        }
+        Command::ClearTraces => {
+            let mut s = shared.lock().expect("shared snapshot poisoned");
+            s.clear_traces();
+        }
+        Command::RecordStart { path } => {
+            let Some(active) = session.as_mut() else {
+                let mut s = shared.lock().expect("shared snapshot poisoned");
+                s.push_log(LogLevel::Warn, "not streaming; cannot record", started);
+                return;
+            };
+            match std::fs::File::create(&path) {
+                Ok(file) => {
+                    active.recorder = Some(Recorder {
+                        writer: std::io::BufWriter::with_capacity(1 << 20, file),
+                        rows: 0,
+                        path: path.clone(),
+                    });
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.recorded_rows = 0;
+                    s.recording = Some(path.clone());
+                    s.push_log(
+                        LogLevel::Info,
+                        format!("recording to {}", path.display()),
+                        started,
+                    );
+                }
+                Err(e) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.push_log(LogLevel::Error, format!("cannot record: {e}"), started);
+                }
+            }
+        }
+        Command::RecordStop => {
+            if let Some(active) = session.as_mut() {
+                if let Some(rec) = active.recorder.take() {
+                    finish_recording(rec, shared, started);
+                }
+            }
+            let mut s = shared.lock().expect("shared snapshot poisoned");
+            s.recording = None;
+        }
+        Command::Quit => {}
+    }
+}
+
+fn finish_recording(mut rec: Recorder, shared: &Arc<Mutex<Shared>>, started: Instant) {
+    use std::io::Write as _;
+    let outcome = rec.writer.flush();
+    let mut s = shared.lock().expect("shared snapshot poisoned");
+    match outcome {
+        Ok(()) => s.push_log(
+            LogLevel::Info,
+            format!("recorded {} rows to {}", rec.rows, rec.path.display()),
+            started,
+        ),
+        Err(e) => s.push_log(LogLevel::Error, format!("recording failed: {e}"), started),
+    }
+}
+
+/// Display bucket width for a given rate.
+///
+/// The window is divided evenly into buckets so the trace covers the same span
+/// at any rate, with a floor of one sample per bucket so low rates are not
+/// aggregated below their own resolution.
+fn bucket_seconds_for(rate: u32) -> f64 {
+    let sample_period = 1.0 / rate.max(1) as f64;
+    (WINDOW_SECONDS / BUCKETS as f64).max(sample_period)
+}
+
+fn start_session(serial: Option<&str>, rate: u32, statistics: bool) -> js220::Result<Session> {
+    let device = Js220::open_with(serial, TransportConfig::default())?;
+    let mut session = Session {
+        device,
+        rate,
+        sample_period: 1.0 / rate as f64,
+        next_index: 0,
+        started: Instant::now(),
+        last_stats: Instant::now(),
+        last_bytes: 0,
+        last_samples: 0,
+        recorder: None,
+    };
+    let cfg = StreamConfig {
+        signals: vec![Signal::Current, Signal::Voltage, Signal::Power],
+        sample_rate: rate,
+        statistics,
+        statistics_rate: 2.0,
+        ..Default::default()
+    };
+    session.device.stream_start(cfg)?;
+    session.started = Instant::now();
+    session.last_stats = Instant::now();
+    Ok(session)
+}
+
+fn pump(session: &mut Session, shared: &Arc<Mutex<Shared>>, started: Instant) -> js220::Result<()> {
+    session.device.poll(POLL)?;
+
+    let bucket_seconds = bucket_seconds_for(session.rate);
+    let n;
+    {
+        let rows = session.device.rows();
+        n = rows.len;
+        if n > 0 {
+            let first_index = session.next_index;
+            let mut guard = shared.lock().expect("shared snapshot poisoned");
+            if let Some(c) = rows.current {
+                guard
+                    .current
+                    .extend(c, first_index, session.sample_period, bucket_seconds);
+            }
+            if let Some(v) = rows.voltage {
+                guard
+                    .voltage
+                    .extend(v, first_index, session.sample_period, bucket_seconds);
+            }
+            if let Some(p) = rows.power {
+                guard
+                    .power
+                    .extend(p, first_index, session.sample_period, bucket_seconds);
+            }
+            guard.current.finish(bucket_seconds);
+            guard.voltage.finish(bucket_seconds);
+            guard.power.finish(bucket_seconds);
+            drop(guard);
+
+            if let Some(rec) = session.recorder.as_mut() {
+                write_rows(rec, &rows, n);
+            }
+            session.next_index += n as u64;
+        }
+    }
+    session.device.consume(n);
+
+    if let Some(stats) = session.device.take_statistics() {
+        shared.lock().expect("shared snapshot poisoned").statistics = Some(stats);
+    }
+
+    // Refresh the headline numbers a few times a second rather than every poll.
+    if session.last_stats.elapsed() >= Duration::from_millis(250) {
+        let window = session.last_stats.elapsed().as_secs_f64();
+        session.last_stats = Instant::now();
+        let counters = *session.device.counters();
+        let real = session
+            .device
+            .signal_counters(Signal::Current)
+            .map_or(0, |c| c.samples);
+        let filled = session
+            .device
+            .signal_counters(Signal::Voltage)
+            .map_or(0, |c| c.filled);
+
+        let mut s = shared.lock().expect("shared snapshot poisoned");
+        s.throughput = (counters.bytes - session.last_bytes) as f64 / window;
+        s.sample_rate = (real - session.last_samples) as f64 / window;
+        s.samples = real;
+        s.filled = filled;
+        s.frame_errors = counters.frame_errors;
+        s.frame_breaks = counters.frame_id_breaks;
+        s.elapsed = session.started.elapsed().as_secs_f64();
+        s.bucket_seconds = bucket_seconds;
+        if let Some(rec) = session.recorder.as_ref() {
+            s.recorded_rows = rec.rows;
+        }
+        let _ = started;
+        session.last_bytes = counters.bytes;
+        session.last_samples = real;
+    }
+    Ok(())
+}
+
+fn write_rows(rec: &mut Recorder, rows: &js220::Rows<'_>, n: usize) {
+    use std::io::Write as _;
+    let mut buf: Vec<u8> = Vec::with_capacity(n * 12);
+    for i in 0..n {
+        for column in [rows.current, rows.voltage, rows.power]
+            .into_iter()
+            .flatten()
+        {
+            let v = column.get(i).copied().unwrap_or(f32::NAN);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    if rec.writer.write_all(&buf).is_ok() {
+        rec.rows += n as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_is_divided_evenly_regardless_of_rate() {
+        let expected = WINDOW_SECONDS / BUCKETS as f64;
+        for rate in [10_000, 100_000, 1_000_000] {
+            assert!(
+                (bucket_seconds_for(rate) - expected).abs() < 1e-12,
+                "rate {rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bucket_never_holds_less_than_one_sample() {
+        // At low rates the sample period is wider than an even division of the
+        // window, so the floor takes over.
+        assert!((bucket_seconds_for(1) - 1.0).abs() < 1e-12);
+        assert!(bucket_seconds_for(100) >= 1.0 / 100.0);
+    }
+
+    #[test]
+    fn a_full_window_fits_the_bucket_ring() {
+        // The ring must be able to hold the whole intended window.
+        let buckets = WINDOW_SECONDS / bucket_seconds_for(1_000_000);
+        assert!(buckets <= BUCKETS as f64, "{buckets} buckets needed");
+    }
+
+    #[test]
+    fn bucket_width_is_never_zero_or_negative() {
+        for rate in [0, 1, 1_000, 2_000_000] {
+            assert!(bucket_seconds_for(rate) > 0.0, "rate {rate}");
+        }
+    }
+
+    #[test]
+    fn status_labels_are_stable() {
+        assert_eq!(Status::Idle.label(), "idle");
+        assert_eq!(Status::Running.label(), "running");
+        assert_eq!(Status::Failed("x".into()).label(), "error");
+    }
+
+    #[test]
+    fn the_log_is_bounded() {
+        let mut s = Shared::new(10);
+        let t = Instant::now();
+        for i in 0..(LOG_LIMIT + 50) {
+            s.push_log(LogLevel::Info, format!("line {i}"), t);
+        }
+        assert_eq!(s.log.len(), LOG_LIMIT);
+        assert!(
+            s.log[0].text.contains(&format!("line {}", 50)),
+            "oldest lines are dropped first, got {}",
+            s.log[0].text
+        );
+    }
+
+    #[test]
+    fn clearing_traces_empties_every_signal() {
+        let mut s = Shared::new(10);
+        s.current.extend(&[1.0; 2000], 0, 1e-6, 1e-3);
+        s.current.finish(1e-3);
+        assert!(!s.current.is_empty());
+        s.clear_traces();
+        assert!(s.current.is_empty());
+        assert!(s.voltage.is_empty());
+        assert!(s.power.is_empty());
+    }
+}

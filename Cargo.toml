@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/js220-proto", "crates/js220", "crates/jsctl"]
+members = ["crates/js220-proto", "crates/js220", "crates/jsctl", "crates/jsgui"]
 
 [workspace.package]
 version = "0.1.0"

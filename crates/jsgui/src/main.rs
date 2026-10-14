@@ -1,0 +1,39 @@
+//! Live GUI for the Joulescope JS220.
+//!
+//! Acquisition runs on its own thread so the USB queue is drained even while
+//! the window is busy rendering: a host that stops draining makes the device
+//! drop samples silently.
+
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+// The GUI is a windowed application; a console would pop up behind it on
+// Windows. Debug builds keep it so logging is visible.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod acquire;
+mod app;
+mod buffer;
+mod fmt;
+
+fn main() -> eframe::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,js220=info"))
+        .init();
+
+    // Deliberately not a full argument parser: the GUI has one switch, and a
+    // dependency for it would not earn its place.
+    let autostart = std::env::args().any(|a| a == "--start");
+
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_title("Joulescope JS220"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Joulescope JS220",
+        options,
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, autostart)))),
+    )
+}

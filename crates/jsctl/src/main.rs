@@ -283,6 +283,34 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
+/// Poll until the device stops publishing, or `max` elapses.
+///
+/// The retained-value dump is hundreds of messages and its duration varies, so
+/// waiting a fixed time either truncates it or wastes seconds. Watching for the
+/// stream of new topics to go quiet adapts to whatever the device actually
+/// does.
+fn drain_until_quiet(dev: &mut Js220, quiet: Duration, max: Duration) -> Result<()> {
+    let started = Instant::now();
+    let deadline = started + max;
+    // The device takes a moment to begin answering, so quiet is only
+    // meaningful after it has had a chance to start. Without this floor the
+    // very first gap is mistaken for the end of the dump.
+    let floor = started + quiet.max(Duration::from_millis(750));
+    let mut last_len = dev.params().len();
+    let mut last_change = started;
+    while Instant::now() < deadline {
+        dev.poll(Duration::from_millis(20))?;
+        let len = dev.params().len();
+        if len != last_len {
+            last_len = len;
+            last_change = Instant::now();
+        } else if Instant::now() >= floor && last_change.elapsed() >= quiet {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn cmd_reset(args: &DeviceArgs) -> Result<()> {
     let info = js220::find(args.serial.as_deref()).context("finding the device")?;
     eprintln!("resetting {} ...", info.serial());
@@ -301,7 +329,7 @@ fn cmd_info(args: &DeviceArgs) -> Result<()> {
 
     // Give the device a moment to publish its retained topic values.
     dev.request_values().context("requesting device values")?;
-    dev.drain(Duration::from_millis(1000));
+    drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(6))?;
 
     let info = dev.connect_info();
     println!("serial            {}", dev.serial());
@@ -319,15 +347,27 @@ fn cmd_info(args: &DeviceArgs) -> Result<()> {
         fmt::bytes(transport.queued_bytes() as u64)
     );
 
+    // Values arrive on `topic?`. The map also holds `topic#` return codes and
+    // `topic$` metadata, which are acknowledgements and schemas rather than
+    // settings, so neither belongs in a summary of the device's state.
     let params = dev.params();
-    if !params.is_empty() {
-        println!("\n{} retained topics:", params.len());
-        let mut topics: Vec<&String> = params.keys().collect();
-        topics.sort();
-        for t in topics {
-            println!("  {:<28} {:?}", t, params[t]);
+    let mut values: Vec<(&str, &js220::proto::value::Value)> = params
+        .iter()
+        .filter_map(|(topic, value)| topic.strip_suffix('?').map(|base| (base, value)))
+        .collect();
+    values.sort_by_key(|(topic, _)| *topic);
+
+    if values.is_empty() {
+        println!("
+No retained values reported.");
+    } else {
+        println!("
+{} retained values:", values.len());
+        for (topic, value) in values {
+            println!("  {topic:<28} {value:?}");
         }
     }
+
     Ok(())
 }
 
@@ -371,9 +411,9 @@ fn cmd_topics(args: &TopicsArgs) -> Result<()> {
     // The metadata dump is hundreds of messages, so this is requested only by
     // the commands that actually need it, and given time to arrive.
     dev.request_metadata().context("requesting metadata")?;
-    dev.drain(Duration::from_millis(1500));
+    drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(8))?;
     dev.request_values().context("requesting values")?;
-    dev.drain(Duration::from_millis(1000));
+    drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(6))?;
 
     let params = dev.params();
 
