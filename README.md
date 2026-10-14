@@ -17,10 +17,10 @@ crates/
 
 ## Status
 
-The protocol layer and the driver logic are complete and unit tested (164
-tests, no hardware required). **The end-to-end path has not yet been exercised
-against a physical JS220** — see [Verification](#verification) for exactly what
-is and is not confirmed.
+The protocol layer and driver logic are complete and unit tested (167 tests, no
+hardware required). Streaming has been **proven against a physical JS220** at
+the full rate, but **starting a stream is currently unreliable** — see
+[Verification](#verification).
 
 ## Build
 
@@ -140,35 +140,57 @@ thread, `jsctl stats` just prints them.
 
 Being precise about this, because "it compiles" is not "it works".
 
-**Confirmed by unit tests** (164 tests, `cargo test`):
+**Confirmed by unit tests** (167 tests, `cargo test`): frame packing and
+parsing, the value union in both directions, pub/sub encoding, port 0 message
+decoding, statistics fixed-point conversion against hand-computed values,
+sample id unwrapping across the 32-bit wrap, signal alignment (gaps, overlaps,
+duplicates, late starts, oversized-gap re-anchoring), the time base, and
+capture round-tripping through real files.
 
-- Frame header packing, parsing, iteration, and recovery from a corrupt frame
-- The value union, in both directions, for every type tag
-- Pub/sub message encoding including topic truncation and the fixed-width field
-- Port 0 connect, echo, time sync and time map decoding
-- Statistics fixed-point conversion, checked against hand-computed Q31/Q27
-  values and a two-level signal whose mean and standard deviation are known
-- Sample id unwrapping across the 32-bit wrap, including repeated wraps
-- Signal alignment: gaps, overlaps, duplicate frames, late-starting signals
-- The time base, including the 2018 epoch and sample-id round trips
-- CSV and binary capture round-tripping through real files
+**Confirmed against hardware** (JS220, fw 1.3.0, FPGA 1.3.3):
 
-**Confirmed against hardware:** device enumeration only (`jsctl list` correctly
-identifies an attached JS220 by serial, mode and product id).
+- Enumeration, open, and the connect handshake.
+- `jsctl topics`, which reads the device's own metadata tree.
+- `jsctl stats` — on-instrument statistics, returning physically sensible
+  values (nA-scale current, µV-scale voltage noise on an idle port).
+- **Full-rate streaming.** Repeated benchmark runs reached **7.75 MiB/s,
+  1,000,009 rows/s — 100.00% of the requested 1 Msps** with both signals
+  balanced, zero undecodable frames, zero frame-sequence breaks, and ~130 NaN
+  samples filled per three-second run (all at stream startup).
 
-**Not yet confirmed against hardware:** opening, the connect handshake,
-streaming, statistics, and the throughput claims above. The architecture is
-sound and the protocol is implemented to spec, but no samples have come off a
-real device through this code yet. Treat the performance section as design
-rationale, not as measurements. `jsctl bench` exists precisely so the claims can
-be checked rather than taken on faith.
+**Known defect: stream startup is unreliable.** When a stream starts, it runs
+perfectly. But across back-to-back sessions it often fails to start at all, and
+the failure rate climbs the longer the device has been in use — from working on
+the first run after a replug to failing consistently after a dozen sessions.
+`stream_start` detects this and returns an error rather than handing back a
+silently empty capture, so it fails loudly, but it does fail.
+
+What is known so far:
+
+- The device acknowledges every configuration publish with a success code even
+  when no samples follow, so the acknowledgement cannot be trusted as proof.
+- The sensor stays powered and responsive throughout (FPGA version reads back,
+  fuses are not engaged), so it is not a protection trip or a power fault.
+- The stream enables are *retained* values that survive a disconnect, so a
+  device left streaming by an interrupted session is still streaming when the
+  next one opens. `open` now forces every port off and drains the backlog, but
+  this did not fully resolve it.
+- WinUSB refuses `reset`, so `jsctl reset` cannot recover a device in software
+  on Windows. Physically replugging does.
+
+A warning for anyone trying to fix this: **the device's state drifts across
+sessions, which silently invalidates A/B testing.** Two consecutive six-run
+trials of the same binary gave 1/6 and then 0/6. Replug between trials, or the
+measurement is meaningless.
+
+The most likely next step is to capture the official driver's open-and-configure
+sequence on the wire and diff it against this one, rather than continuing to
+guess at timing.
 
 **Implemented to spec but not exercised by any firmware:** the `u4` and `u1`
-run-length decoders for the current-range and GPI streams. Current JS220
-firmware ships those streams uncompressed — the reference driver notes the same
-— so they are covered by unit tests against the documented format only. The bit
-order within a `u1` literal token follows the little-endian convention used
-everywhere else in the protocol but has not been confirmed on a device.
+run-length decoders for the current-range and GPI streams. Current firmware
+ships those uncompressed — the reference driver notes the same — so they are
+covered by unit tests against the documented format only.
 
 ## Scope
 

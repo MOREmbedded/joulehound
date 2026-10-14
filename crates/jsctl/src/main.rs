@@ -664,13 +664,13 @@ fn report_health(counters: &js220::Counters, dev: &Js220, signals: &[Signal], _e
         "frames   {} ok, {} undecodable, {} sequence breaks",
         counters.frames, counters.frame_errors, counters.frame_id_breaks
     );
+    // Printed for every signal, including the clean ones. Reporting only
+    // anomalies hides the most important failure of all: a signal that
+    // delivered nothing at all has no anomalies to report.
     for s in signals {
         let Some(c) = dev.signal_counters(*s) else {
             continue;
         };
-        if c.filled == 0 && c.skipped == 0 && c.discontinuities == 0 {
-            continue;
-        }
         eprintln!(
             "{:<8} {} samples, {} filled over gaps, {} repeated, {} discontinuities",
             s.name(),

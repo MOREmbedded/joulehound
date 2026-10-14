@@ -210,14 +210,31 @@ impl Link {
             .usb_context("opening bulk OUT endpoint")?;
 
         let transfer_size = cfg.effective_transfer_size();
-        Ok(Self {
+        let mut link = Self {
             interface,
             ep_in,
             ep_out,
             out_frame_id: 0,
             cfg,
             transfer_size,
-        })
+        };
+
+        // A session that was interrupted mid-stream can leave an endpoint
+        // halted, and a halted bulk IN pipe delivers nothing while every
+        // control request still succeeds. Clearing both is harmless when they
+        // are already healthy.
+        link.clear_halts();
+        Ok(link)
+    }
+
+    /// Clear any halt condition on both bulk endpoints.
+    fn clear_halts(&mut self) {
+        if let Err(e) = self.ep_in.clear_halt().wait() {
+            log::debug!("clearing bulk IN halt: {e}");
+        }
+        if let Err(e) = self.ep_out.clear_halt().wait() {
+            log::debug!("clearing bulk OUT halt: {e}");
+        }
     }
 
     /// The transport tuning in effect.

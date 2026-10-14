@@ -27,6 +27,20 @@ pub const MIN_SAMPLE_RATE: u32 = 1_000;
 /// arrives to belong to the new state.
 const SETTLE: Duration = Duration::from_millis(250);
 
+/// How long to wait for the device to acknowledge a publish.
+const ACK_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// How long to let a backlog drain when forcing the device quiet.
+const QUIESCE: Duration = Duration::from_millis(400);
+
+/// Every topic that enables a data port.
+const ALL_STREAM_CTRL: [&str; 4] = [
+    topics::S_CURRENT_CTRL,
+    topics::S_VOLTAGE_CTRL,
+    topics::S_POWER_CTRL,
+    topics::S_STATS_CTRL,
+];
+
 // Range enumerations, taken from the options tables the instrument publishes in
 // its own metadata. Run `jsctl topics` to print them from a live device.
 
@@ -326,7 +340,24 @@ impl Js220 {
         // on their heels was being dropped. Commands that need the topic tree
         // ask for it explicitly instead.
         dev.drain(SETTLE);
+
+        // The stream enables are retained values that survive a disconnect, so
+        // a device left streaming by an interrupted session is still streaming
+        // now. Force every port off and let the backlog drain, otherwise the
+        // next `stream_start` is racing a flood of stale samples.
+        dev.quiesce();
         Ok(dev)
+    }
+
+    /// Disable every data port and discard whatever is still in flight.
+    fn quiesce(&mut self) {
+        for topic in ALL_STREAM_CTRL {
+            if let Err(e) = self.publish(topic, Value::U8(0)) {
+                log::debug!("quiesce {topic}: {e}");
+            }
+        }
+        self.drain(QUIESCE);
+        self.group.reset();
     }
 
     /// Poll for `duration`, discarding whatever arrives.
@@ -444,6 +475,59 @@ impl Js220 {
         self.link.send_frame(frame::PORT_PUBSUB, &payload)
     }
 
+    /// Publish and wait for the device's return-code acknowledgement.
+    ///
+    /// Every publish is answered on `{topic}#` with 0 or an error code. A
+    /// publish issued while the device is still busy with its own post-connect
+    /// traffic can be dropped silently, so waiting for the ack is the only way
+    /// to know a setting actually landed.
+    pub fn publish_confirmed(
+        &mut self,
+        topic: &str,
+        value: Value,
+        timeout: Duration,
+    ) -> Result<()> {
+        let ack = format!("{topic}#");
+        // Drop any ack from an earlier publish so a stale one is not mistaken
+        // for the answer to this one.
+        self.params.remove(&ack);
+        self.publish(topic, value)?;
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.poll(Duration::from_millis(20))?;
+            if let Some(v) = self.params.get(&ack) {
+                let code = v.as_i64().unwrap_or(0);
+                if code != 0 {
+                    return Err(Error::Config {
+                        reason: format!("device rejected {topic} with code {code}"),
+                    });
+                }
+                return Ok(());
+            }
+        }
+        Err(Error::Timeout {
+            context: "a publish acknowledgement",
+        })
+    }
+
+    /// Publish, waiting for the acknowledgement but tolerating its absence.
+    ///
+    /// An explicit error code from the device is a real failure and is
+    /// reported. A missing acknowledgement is not: the setting may still have
+    /// been applied, and `stream_start` verifies the outcome by checking that
+    /// samples actually arrive. Failing here would turn a slow reply into a
+    /// dead stream.
+    fn publish_checked(&mut self, topic: &str, value: Value) -> Result<()> {
+        match self.publish_confirmed(topic, value, ACK_TIMEOUT) {
+            Err(Error::Timeout { .. }) => {
+                log::debug!("no acknowledgement for {topic}; continuing");
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     /// Ask the device to re-publish the metadata for its whole topic tree.
     pub fn request_metadata(&mut self) -> Result<()> {
         self.publish_raw(TOPIC_METADATA_ALL, Value::Null)
@@ -529,15 +613,18 @@ impl Js220 {
         self.scratch.clear();
         self.expect_frame_id = None;
 
-        for signal in &device_signals {
-            let topic = match signal {
-                Signal::Current => topics::S_CURRENT_CTRL,
-                Signal::Voltage => topics::S_VOLTAGE_CTRL,
-                Signal::Power => continue,
-            };
+        let ctrl_topics: Vec<&str> = device_signals
+            .iter()
+            .filter_map(|s| match s {
+                Signal::Current => Some(topics::S_CURRENT_CTRL),
+                Signal::Voltage => Some(topics::S_VOLTAGE_CTRL),
+                Signal::Power => None,
+            })
+            .collect();
+        for topic in &ctrl_topics {
             // The instrument declares the ctrl topics as u8; publishing the
             // type it expects avoids relying on its coercion rules.
-            self.publish(topic, Value::U8(1))?;
+            self.publish_checked(topic, Value::U8(1))?;
         }
 
         if config.statistics {
@@ -552,13 +639,29 @@ impl Js220 {
         self.config = Some(config);
         self.streaming = true;
 
-        // Give the instrument a moment to apply the settings, then discard
-        // everything received up to this point: it was queued before the
-        // stream was configured, or left over from a previous session. The
-        // caller's first row is then genuinely the first row.
+        // Acknowledgement is not the same as data. Let the ports spin up, then
+        // check that every requested signal is actually producing before
+        // handing control back, so a dead port surfaces here rather than as a
+        // silently empty capture.
         self.drain(SETTLE);
         self.group.reset();
+        self.drain(SETTLE);
+        if !self.streams_are_live(&device_signals) {
+            return Err(Error::Timeout {
+                context: "samples to start arriving after enabling the streams",
+            });
+        }
+        self.group.reset();
         Ok(())
+    }
+
+    /// True when every requested signal has delivered at least one sample.
+    fn streams_are_live(&self, signals: &[Signal]) -> bool {
+        signals.iter().all(|s| {
+            self.group
+                .counters(*s)
+                .is_some_and(|c| c.samples > 0)
+        })
     }
 
     /// Stop streaming and disable every data port.
@@ -799,22 +902,35 @@ impl Js220 {
         self.group.counters(signal)
     }
 
-    /// Stop streaming and tell the device the host is going away.
+    /// Tell the device the host is going away and tear down the link.
+    ///
+    /// Deliberately does not publish stream-disable settings first. The
+    /// disconnect request is what stops the instrument streaming; pushing
+    /// configuration into a device that is about to be disconnected only risks
+    /// leaving it half-applied for the next session.
     pub fn close(mut self) -> Result<()> {
-        let stop = self.stream_stop();
-        self.link.cancel_in();
+        self.streaming = false;
+        for topic in ALL_STREAM_CTRL {
+            let _ = self.publish(topic, Value::U8(0));
+        }
         let disconnect = self.link.disconnect();
-        stop.and(disconnect)
+        self.link.cancel_in();
+        disconnect
     }
 }
 
 impl Drop for Js220 {
     fn drop(&mut self) {
-        if self.streaming {
-            let _ = self.stream_stop();
+        // The enables are retained on the device, so leaving them set would
+        // have it streaming into nothing until something else turns it off.
+        // Order matters: stop the ports and disconnect before reclaiming the
+        // transfers, or the endpoint can be left halted for the next session.
+        self.streaming = false;
+        for topic in ALL_STREAM_CTRL {
+            let _ = self.publish(topic, Value::U8(0));
         }
-        self.link.cancel_in();
         let _ = self.link.disconnect();
+        self.link.cancel_in();
     }
 }
 
