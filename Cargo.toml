@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/js220-proto", "crates/js220", "crates/jsctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/local/joulescope-rs"
+authors = ["Bartosz Ziolek"]
+
+[workspace.dependencies]
+js220-proto = { path = "crates/js220-proto", version = "0.1.0" }
+js220 = { path = "crates/js220", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+# `bench` inherits release so criterion-style timing matches shipped builds.
+[profile.bench]
+inherits = "release"
+debug = true

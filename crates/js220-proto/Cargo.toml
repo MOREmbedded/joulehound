@@ -1,0 +1,15 @@
+[package]
+name = "js220-proto"
+description = "Wire protocol codec for the Joulescope JS220 precision energy analyzer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
