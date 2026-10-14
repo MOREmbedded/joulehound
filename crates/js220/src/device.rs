@@ -27,20 +27,6 @@ pub const MIN_SAMPLE_RATE: u32 = 1_000;
 /// arrives to belong to the new state.
 const SETTLE: Duration = Duration::from_millis(250);
 
-/// How long to wait for the device to acknowledge a publish.
-const ACK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long to wait for a pub/sub round trip.
-const PING_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Every topic that enables a data port.
-const ALL_STREAM_CTRL: [&str; 4] = [
-    topics::S_CURRENT_CTRL,
-    topics::S_VOLTAGE_CTRL,
-    topics::S_POWER_CTRL,
-    topics::S_STATS_CTRL,
-];
-
 // Range enumerations, taken from the options tables the instrument publishes in
 // its own metadata. Run `jsctl topics` to print them from a live device.
 
@@ -71,6 +57,20 @@ const V_RANGE_MODE_MANUAL: u8 = 1;
 const V_RANGE_2V: u8 = 1;
 /// Voltage range selector for the 15 V range.
 const V_RANGE_15V: u8 = 0;
+
+/// Pick a starting ping value unlikely to collide with a previous session's.
+///
+/// Only the low byte survives the device's round trip, so the seed has to fit
+/// in a `u8`. That is a small space, but it still makes accepting a stale pong
+/// from an earlier process unlikely rather than near-certain, which a fixed
+/// start of 1 made it.
+fn session_ping_seed() -> u8 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| d.subsec_nanos());
+    (nanos % 251) as u8 + 1
+}
 
 /// Current range selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -247,9 +247,9 @@ pub struct Js220 {
     config: Option<StreamConfig>,
     params: HashMap<String, Value>,
     statistics: Option<Statistics>,
-    /// Value carried by the most recent pong, used as a round-trip barrier.
-    last_pong: Option<u32>,
-    next_ping: u32,
+    /// Low byte of the most recent pong, used as a round-trip barrier.
+    last_pong: Option<u8>,
+    next_ping: u8,
     time_map: TimeMap,
     counters: Counters,
     expect_frame_id: Option<u16>,
@@ -303,7 +303,11 @@ impl Js220 {
             params: HashMap::new(),
             statistics: None,
             last_pong: None,
-            next_ping: 1,
+            // Seeded per session rather than from a fixed value. The device
+            // can still have pongs queued from a previous process, and a
+            // counter that always starts at 1 would accept one of those as the
+            // answer to a ping it never saw.
+            next_ping: session_ping_seed(),
             time_map: TimeMap::new(),
             counters: Counters::default(),
             expect_frame_id: None,
@@ -321,44 +325,8 @@ impl Js220 {
         // removed: those are hundreds of messages, and configuration published
         // on their heels was being dropped. Commands that need the topic tree
         // ask for it explicitly instead.
-        // Follow the reference driver's open sequence. Connecting does not
-        // leave the instrument in a state the host can rely on, and publishing
-        // only the few topics a capture needs leaves everything else as the
-        // previous session left it — which makes streaming fail to start.
-        dev.restore_defaults()?;
+        dev.drain(SETTLE);
         Ok(dev)
-    }
-
-    /// Push the known-good parameter set and leave the device quiet.
-    ///
-    /// Mirrors the reference driver: request metadata, barrier, restore every
-    /// parameter, request the retained values, barrier. The barriers matter —
-    /// the instrument processes messages in order, so a returned pong proves
-    /// the restore has been applied before anything is enabled.
-    fn restore_defaults(&mut self) -> Result<()> {
-        self.request_metadata()?;
-        self.barrier();
-
-        for param in crate::defaults::DEFAULTS {
-            self.publish(param.topic, param.value.clone())?;
-        }
-
-        self.request_values()?;
-        self.barrier();
-
-        self.group.reset();
-        Ok(())
-    }
-
-    /// Wait for the device to catch up, logging rather than failing if it does
-    /// not answer in time.
-    ///
-    /// A missed pong is not proof of a broken device, and failing the open over
-    /// one would turn a slow reply into an unusable instrument.
-    fn barrier(&mut self) {
-        if let Err(e) = self.ping(PING_TIMEOUT) {
-            log::debug!("no sequencing pong: {e}");
-        }
     }
 
     /// Poll for `duration`, discarding whatever arrives.
@@ -390,7 +358,7 @@ impl Js220 {
         let value = self.next_ping;
         self.next_ping = self.next_ping.wrapping_add(1).max(1);
         self.last_pong = None;
-        self.publish_raw(js220_proto::pubsub::TOPIC_PING, Value::U32(value))?;
+        self.publish_raw(js220_proto::pubsub::TOPIC_PING, Value::U32(value as u32))?;
 
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -474,59 +442,6 @@ impl Js220 {
             topic: topic.to_owned(),
         })?;
         self.link.send_frame(frame::PORT_PUBSUB, &payload)
-    }
-
-    /// Publish and wait for the device's return-code acknowledgement.
-    ///
-    /// Every publish is answered on `{topic}#` with 0 or an error code. A
-    /// publish issued while the device is still busy with its own post-connect
-    /// traffic can be dropped silently, so waiting for the ack is the only way
-    /// to know a setting actually landed.
-    pub fn publish_confirmed(
-        &mut self,
-        topic: &str,
-        value: Value,
-        timeout: Duration,
-    ) -> Result<()> {
-        let ack = format!("{topic}#");
-        // Drop any ack from an earlier publish so a stale one is not mistaken
-        // for the answer to this one.
-        self.params.remove(&ack);
-        self.publish(topic, value)?;
-
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            self.poll(Duration::from_millis(20))?;
-            if let Some(v) = self.params.get(&ack) {
-                let code = v.as_i64().unwrap_or(0);
-                if code != 0 {
-                    return Err(Error::Config {
-                        reason: format!("device rejected {topic} with code {code}"),
-                    });
-                }
-                return Ok(());
-            }
-        }
-        Err(Error::Timeout {
-            context: "a publish acknowledgement",
-        })
-    }
-
-    /// Publish, waiting for the acknowledgement but tolerating its absence.
-    ///
-    /// An explicit error code from the device is a real failure and is
-    /// reported. A missing acknowledgement is not: the setting may still have
-    /// been applied, and `stream_start` verifies the outcome by checking that
-    /// samples actually arrive. Failing here would turn a slow reply into a
-    /// dead stream.
-    fn publish_checked(&mut self, topic: &str, value: Value) -> Result<()> {
-        match self.publish_confirmed(topic, value, ACK_TIMEOUT) {
-            Err(Error::Timeout { .. }) => {
-                log::debug!("no acknowledgement for {topic}; continuing");
-                Ok(())
-            }
-            other => other,
-        }
     }
 
     /// Ask the device to re-publish the metadata for its whole topic tree.
@@ -614,24 +529,15 @@ impl Js220 {
         self.scratch.clear();
         self.expect_frame_id = None;
 
-        let ctrl_topics: Vec<&str> = device_signals
-            .iter()
-            .filter_map(|s| match s {
-                Signal::Current => Some(topics::S_CURRENT_CTRL),
-                Signal::Voltage => Some(topics::S_VOLTAGE_CTRL),
-                Signal::Power => None,
-            })
-            .collect();
-        // Resize the bulk IN queue *before* enabling anything. Retuning cancels
-        // every pending transfer, so doing it after the enables would pull the
-        // device's buffers away the instant it started sending and stall the
-        // stream it had just acknowledged.
-        self.link.set_streaming_transfers();
-
-        for topic in &ctrl_topics {
+        for signal in &device_signals {
+            let topic = match signal {
+                Signal::Current => topics::S_CURRENT_CTRL,
+                Signal::Voltage => topics::S_VOLTAGE_CTRL,
+                Signal::Power => continue,
+            };
             // The instrument declares the ctrl topics as u8; publishing the
             // type it expects avoids relying on its coercion rules.
-            self.publish_checked(topic, Value::U8(1))?;
+            self.publish(topic, Value::U8(1))?;
         }
 
         if config.statistics {
@@ -646,29 +552,13 @@ impl Js220 {
         self.config = Some(config);
         self.streaming = true;
 
-        // Acknowledgement is not the same as data. Let the ports spin up, then
-        // check that every requested signal is actually producing before
-        // handing control back, so a dead port surfaces here rather than as a
-        // silently empty capture.
+        // Give the instrument a moment to apply the settings, then discard
+        // everything received up to this point: it was queued before the
+        // stream was configured, or left over from a previous session. The
+        // caller's first row is then genuinely the first row.
         self.drain(SETTLE);
-        self.group.reset();
-        self.drain(SETTLE);
-        if !self.streams_are_live(&device_signals) {
-            return Err(Error::Timeout {
-                context: "samples to start arriving after enabling the streams",
-            });
-        }
         self.group.reset();
         Ok(())
-    }
-
-    /// True when every requested signal has delivered at least one sample.
-    fn streams_are_live(&self, signals: &[Signal]) -> bool {
-        signals.iter().all(|s| {
-            self.group
-                .counters(*s)
-                .is_some_and(|c| c.samples > 0)
-        })
     }
 
     /// Stop streaming and disable every data port.
@@ -677,7 +567,6 @@ impl Js220 {
             return Ok(());
         }
         self.streaming = false;
-        self.link.set_config_transfers();
         // Turn everything off even if one publish fails, so a partial failure
         // does not leave the instrument streaming into a queue nobody drains.
         let mut first_err = None;
@@ -795,10 +684,8 @@ impl Js220 {
                     js220_proto::port0::encode_timesync_response(ts.start_count, recv, time::now());
                 responses.push((frame::PORT_ADMIN, payload));
                 self.counters.timesyncs += 1;
-                log::debug!("timesync #{} answered", self.counters.timesyncs);
             }
             Port0Body::TimeMap(tm) => {
-                log::debug!("timemap counter={} rate={}", tm.counter, tm.counter_rate_hz());
                 self.time_map
                     .update(tm.utc_q30, tm.counter, tm.counter_rate_hz());
             }
@@ -814,7 +701,10 @@ impl Js220 {
             Ok(msg) => {
                 log::trace!("pubsub {} = {:?}", msg.topic, msg.value);
                 if msg.topic == js220_proto::pubsub::TOPIC_PONG {
-                    self.last_pong = msg.value.as_i64().map(|v| v as u32);
+                    // Compared narrowly: the device echoes the ping through a
+                    // narrower field than it was published in, so only the low
+                    // byte reliably survives the round trip.
+                    self.last_pong = msg.value.as_i64().map(|v| v as u8);
                 }
                 self.params.insert(msg.topic, msg.value);
             }
@@ -909,39 +799,22 @@ impl Js220 {
         self.group.counters(signal)
     }
 
-    /// Tell the device the host is going away and tear down the link.
-    ///
-    /// Deliberately does not publish stream-disable settings first. The
-    /// disconnect request is what stops the instrument streaming; pushing
-    /// configuration into a device that is about to be disconnected only risks
-    /// leaving it half-applied for the next session.
+    /// Stop streaming and tell the device the host is going away.
     pub fn close(mut self) -> Result<()> {
-        self.streaming = false;
-        // Small transfers again so the disable acknowledgements are not stuck
-        // waiting for a large buffer to fill.
-        self.link.set_config_transfers();
-        for topic in ALL_STREAM_CTRL {
-            let _ = self.publish(topic, Value::U8(0));
-        }
-        let disconnect = self.link.disconnect();
+        let stop = self.stream_stop();
         self.link.cancel_in();
-        disconnect
+        let disconnect = self.link.disconnect();
+        stop.and(disconnect)
     }
 }
 
 impl Drop for Js220 {
     fn drop(&mut self) {
-        // The enables are retained on the device, so leaving them set would
-        // have it streaming into nothing until something else turns it off.
-        // Order matters: stop the ports and disconnect before reclaiming the
-        // transfers, or the endpoint can be left halted for the next session.
-        self.streaming = false;
-        self.link.set_config_transfers();
-        for topic in ALL_STREAM_CTRL {
-            let _ = self.publish(topic, Value::U8(0));
+        if self.streaming {
+            let _ = self.stream_stop();
         }
-        let _ = self.link.disconnect();
         self.link.cancel_in();
+        let _ = self.link.disconnect();
     }
 }
 

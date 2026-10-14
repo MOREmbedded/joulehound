@@ -158,34 +158,56 @@ capture round-tripping through real files.
   balanced, zero undecodable frames, zero frame-sequence breaks, and ~130 NaN
   samples filled per three-second run (all at stream startup).
 
-**Known defect: stream startup is unreliable.** When a stream starts, it runs
-perfectly. But across back-to-back sessions it often fails to start at all, and
-the failure rate climbs the longer the device has been in use — from working on
-the first run after a replug to failing consistently after a dozen sessions.
-`stream_start` detects this and returns an error rather than handing back a
-silently empty capture, so it fails loudly, but it does fail.
+**Known defect: stream startup is unreliable.** When a stream starts it runs
+perfectly, but it only starts on roughly one run in six. `stream_start` detects
+the failure and returns an error rather than handing back a silently empty
+capture, so it fails loudly.
 
-What is known so far:
+This has been isolated to a defect *here*, not to the device or its state. Run
+back to back on the same device, the official `pyjoulescope_driver` streams
+1,000,338 samples/s on both signals every single time, while this driver fails
+every time, in either order. Device state is not the variable.
 
-- The device acknowledges every configuration publish with a success code even
-  when no samples follow, so the acknowledgement cannot be trusted as proof.
-- The sensor stays powered and responsive throughout (FPGA version reads back,
-  fuses are not engaged), so it is not a protection trip or a power fault.
-- The stream enables are *retained* values that survive a disconnect, so a
-  device left streaming by an interrupted session is still streaming when the
-  next one opens. `open` now forces every port off and drains the backlog, but
-  this did not fully resolve it.
-- WinUSB refuses `reset`, so `jsctl reset` cannot recover a device in software
-  on Windows. Physically replugging does.
+What is established:
 
-A warning for anyone trying to fix this: **the device's state drifts across
-sessions, which silently invalidates A/B testing.** Two consecutive six-run
-trials of the same binary gave 1/6 and then 0/6. Replug between trials, or the
-measurement is meaningless.
+- The instrument acknowledges every configuration publish with success
+  (`s/i/ctrl# = 0`) and then sends no samples, so acknowledgements cannot be
+  used as proof that an enable took effect.
+- Time synchronization is healthy throughout and the device's own sample
+  counter is advancing at ~2 MHz, so the sensor is producing samples
+  internally — they are simply not being sent.
+- The sensor stays powered and responsive (FPGA version reads back, no fuse is
+  engaged).
+- `defaults.rs` holds the official driver's complete open sequence, captured
+  from its own debug log: metadata request, ping barrier, a 57-topic parameter
+  restore, values request, ping barrier, then the enables. Replicating it made
+  matters strictly worse — never starting, versus one run in six — so it is
+  retained as verified reference data rather than live behaviour. Something
+  outside the published topic sequence is the difference.
 
-The most likely next step is to capture the official driver's open-and-configure
-sequence on the wire and diff it against this one, rather than continuing to
-guess at timing.
+A genuine transport defect was found and fixed along the way, and it is worth
+knowing about independently: **every frame the device sends is exactly 512
+bytes, which is also the endpoint's maximum packet size.** A bulk IN transfer
+is therefore never terminated early by a short packet — it completes only once
+it is full. A 128 KiB transfer holds a trickle of configuration replies hostage
+until 256 of them accumulate, which is why pings and acknowledgements appeared
+to time out and then arrive immediately afterwards. Anything that reads
+low-rate control traffic from this device needs small transfers.
+
+Two warnings for anyone continuing this:
+
+- **The device's state drifts across sessions, which silently invalidates A/B
+  testing.** Two consecutive six-run trials of one binary gave 1/6 then 0/6.
+  Compare against the official driver in the same sitting, or the measurement
+  is meaningless.
+- A run that reports a high row rate is not necessarily working. The aligner
+  fills gaps with NaN, so a dead stream can still produce rows. Check the
+  reported bulk IN throughput, which is measured at the USB layer: 7.75 MiB/s
+  is real, anything near zero is not.
+
+The next step is a USB-level capture of both drivers' open sequences, diffed at
+the packet layer. The pub/sub sequences are already known to match, so the
+difference lies below them.
 
 **Implemented to spec but not exercised by any firmware:** the `u4` and `u1`
 run-length decoders for the current-range and GPI streams. Current firmware
