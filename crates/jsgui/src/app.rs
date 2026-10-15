@@ -14,7 +14,11 @@ use crate::fmt;
 use crate::raw::RawTrace;
 
 /// Sample rates offered in the toolbar. Every one divides 2 MHz exactly.
-const RATES: [u32; 7] = [1_000, 10_000, 50_000, 100_000, 200_000, 500_000, 1_000_000];
+const RATES: [u32; 8] = [
+    1_000, 10_000, 50_000, 100_000, 200_000, 500_000, 1_000_000,
+    // Only the raw ADC ports reach this, and only as uncalibrated counts.
+    2_000_000,
+];
 
 /// Time spans offered for the live view, in seconds.
 const WINDOWS: [f64; 8] = [0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
@@ -53,6 +57,26 @@ const VIEWS: [SignalView; 3] = [
         colour: egui::Color32::from_rgb(230, 120, 220),
     },
 ];
+
+/// The acquisition path a rate implies.
+///
+/// Only the raw ADC ports reach the full base rate, so asking for it is
+/// asking for them.
+fn source_for(rate: u32) -> Source {
+    if rate >= js220::BASE_RATE {
+        Source::RawAdc
+    } else {
+        Source::Calibrated
+    }
+}
+
+/// Label a rate, naming the trade when it is not a calibrated measurement.
+fn rate_label(rate: u32) -> String {
+    match source_for(rate) {
+        Source::RawAdc => format!("{} raw ADC", fmt::rate(rate)),
+        Source::Calibrated => fmt::rate(rate),
+    }
+}
 
 /// Relabel the views for the acquisition path in use.
 ///
@@ -101,8 +125,6 @@ pub struct App {
     devices: Vec<String>,
     rate: u32,
     statistics: bool,
-    /// Which acquisition path to request on the next Start.
-    source: Source,
     record_path: String,
     show_log: bool,
     /// Keep the newest data in view. Shared, because the plots share one
@@ -149,7 +171,6 @@ impl App {
             devices: Vec::new(),
             rate: 1_000_000,
             statistics: true,
-            source: Source::Calibrated,
             record_path: default_record_path(),
             show_log: false,
             follow: [true; VIEWS.len()],
@@ -167,7 +188,7 @@ impl App {
         if autostart && app.serial.is_some() {
             app.acq.send(Command::Start {
                 serial: app.serial.clone(),
-                source: app.source,
+                source: source_for(app.rate),
                 rate: app.rate,
                 statistics: app.statistics,
             });
@@ -239,39 +260,23 @@ impl App {
                     if ui.button("⟳").on_hover_text("Rescan for devices").clicked() {
                         self.rescan();
                     }
-                    egui::ComboBox::from_id_salt("source")
-                        .width(132.0)
-                        .selected_text(match self.source {
-                            Source::Calibrated => "Calibrated",
-                            Source::RawAdc => "Raw ADC",
-                        })
+                    // One control, because a rate is what the user is
+                    // choosing. 2 MHz is only reachable through the raw ADC
+                    // ports, so picking it selects that path; the label says
+                    // so rather than hiding it behind a second selector.
+                    egui::ComboBox::from_id_salt("rate")
+                        .width(150.0)
+                        .selected_text(rate_label(self.rate))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.source,
-                                Source::Calibrated,
-                                "Calibrated",
-                            )
-                            .on_hover_text("Amperes and volts, up to 1 MHz");
-                            ui.selectable_value(&mut self.source, Source::RawAdc, "Raw ADC")
-                                .on_hover_text(
-                                    "Uncalibrated ADC counts at 2 MHz: twice the rate,                                      no gain, offset or range correction applied",
-                                );
+                            for r in RATES {
+                                ui.selectable_value(&mut self.rate, r, rate_label(r))
+                                    .on_hover_text(if r >= js220::BASE_RATE {
+                                        "Uncalibrated ADC counts: no gain, offset or                                          range correction applied"
+                                    } else {
+                                        "Calibrated amperes and volts"
+                                    });
+                            }
                         });
-                    // The rate selector only governs the calibrated path; raw
-                    // ADC is fixed at the full base rate.
-                    ui.add_enabled_ui(self.source == Source::Calibrated, |ui| {
-                        egui::ComboBox::from_id_salt("rate")
-                            .width(84.0)
-                            .selected_text(match self.source {
-                                Source::Calibrated => fmt::rate(self.rate),
-                                Source::RawAdc => fmt::rate(js220::BASE_RATE),
-                            })
-                            .show_ui(ui, |ui| {
-                                for r in RATES {
-                                    ui.selectable_value(&mut self.rate, r, fmt::rate(r));
-                                }
-                            });
-                    });
                 });
 
                 if running {
@@ -284,7 +289,7 @@ impl App {
                 {
                     self.acq.send(Command::Start {
                         serial: self.serial.clone(),
-                        source: self.source,
+                        source: source_for(self.rate),
                         rate: self.rate,
                         statistics: self.statistics,
                     });
@@ -292,8 +297,8 @@ impl App {
 
                 ui.separator();
                 ui.label("Signals:");
-                for (i, view) in views_for(self.source, (0, 1)).iter().enumerate() {
-                    let short = match self.source {
+                for (i, view) in views_for(source_for(self.rate), (0, 1)).iter().enumerate() {
+                    let short = match source_for(self.rate) {
                         Source::Calibrated => view.unit[..1].to_string(),
                         Source::RawAdc => i.to_string(),
                     };
@@ -999,11 +1004,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_offered_rate_divides_the_base_rate() {
+    fn every_offered_rate_is_one_the_instrument_can_produce() {
         for r in RATES {
             assert_eq!(js220::BASE_RATE % r, 0, "{r} Hz does not divide the base rate");
-            assert!((js220::MIN_SAMPLE_RATE..=js220::MAX_SAMPLE_RATE).contains(&r));
+            match source_for(r) {
+                // Calibrated rates come from the analog ports, which stop at
+                // the 1 Msps ceiling.
+                Source::Calibrated => assert!(
+                    (js220::MIN_SAMPLE_RATE..=js220::MAX_SAMPLE_RATE).contains(&r),
+                    "{r} Hz is outside the calibrated range"
+                ),
+                // Only the base rate itself is reachable from the ADC ports.
+                Source::RawAdc => assert_eq!(r, js220::BASE_RATE),
+            }
         }
+    }
+
+    #[test]
+    fn only_the_base_rate_selects_the_raw_path() {
+        assert_eq!(source_for(1_000_000), Source::Calibrated);
+        assert_eq!(source_for(500_000), Source::Calibrated);
+        assert_eq!(source_for(js220::BASE_RATE), Source::RawAdc);
+    }
+
+    #[test]
+    fn the_raw_rate_is_labelled_as_uncalibrated() {
+        // The one entry that is not a measurement has to say so in the list,
+        // or it reads as simply the fastest setting.
+        let label = rate_label(js220::BASE_RATE);
+        assert!(label.contains("raw"), "got {label}");
+        assert!(!rate_label(1_000_000).contains("raw"));
+    }
+
+    #[test]
+    fn the_rate_list_offers_the_full_base_rate() {
+        // This is the whole point of the merged control: 2 MHz is reachable
+        // from the rate list rather than hidden behind a second selector.
+        assert!(RATES.contains(&js220::BASE_RATE));
     }
 
     #[test]
