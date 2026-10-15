@@ -172,7 +172,9 @@ impl<'a> Iterator for FrameIter<'a> {
             return None;
         }
         if self.buf.len() < FRAME_LEN {
-            let err = FrameError::Short { len: self.buf.len() };
+            let err = FrameError::Short {
+                len: self.buf.len(),
+            };
             self.buf = &[];
             return Some(Err(err));
         }
@@ -273,7 +275,10 @@ mod tests {
     #[test]
     fn parse_rejects_short_buffer() {
         let buf = [0u8; 16];
-        assert_eq!(Frame::parse(&buf).unwrap_err(), FrameError::Short { len: 16 });
+        assert_eq!(
+            Frame::parse(&buf).unwrap_err(),
+            FrameError::Short { len: 16 }
+        );
     }
 
     #[test]

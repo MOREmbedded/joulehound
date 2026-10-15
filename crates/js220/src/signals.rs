@@ -196,9 +196,7 @@ impl SignalGroup {
 
     /// Counters for one signal, or `None` if it is not enabled.
     pub fn counters(&self, signal: Signal) -> Option<SignalCounters> {
-        self.channels[signal.index()]
-            .as_ref()
-            .map(|c| c.counters)
+        self.channels[signal.index()].as_ref().map(|c| c.counters)
     }
 
     /// Append a frame's worth of samples for `signal`.
@@ -224,7 +222,9 @@ impl SignalGroup {
         scratch.clear();
 
         let (emitted, passthrough) = {
-            let channel = self.channels[index].as_mut().expect("presence checked above");
+            let channel = self.channels[index]
+                .as_mut()
+                .expect("presence checked above");
             let raw_sample_id = channel.unwrap.update(raw_id);
             if channel.decimator.is_passthrough() {
                 (Some(raw_sample_id), true)
@@ -274,7 +274,10 @@ impl SignalGroup {
         // relates to what the device is sending — a frame left over from a
         // previous session, or a counter that jumped. Re-anchor rather than
         // synthesizing millions of samples to bridge it.
-        let next_id = self.channels[index].as_ref().expect("caller checked").next_id;
+        let next_id = self.channels[index]
+            .as_ref()
+            .expect("caller checked")
+            .next_id;
         if id > next_id && (id - next_id) / decimate > self.max_fill as u64 {
             log::debug!(
                 "{} sample id jumped from {next_id} to {id}; re-anchoring",

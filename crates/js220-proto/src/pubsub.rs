@@ -90,16 +90,15 @@ impl PubSubMsg {
             });
         }
         let raw_topic = &payload[..TOPIC_LEN];
-        let end = raw_topic
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(TOPIC_LEN);
+        let end = raw_topic.iter().position(|&b| b == 0).unwrap_or(TOPIC_LEN);
         let topic = core::str::from_utf8(&raw_topic[..end])
             .map_err(|_| PubSubError::TopicUtf8)?
             .into();
         let tag = payload[TOPIC_LEN];
-        let dtype = DType::from_u8(tag).ok_or(PubSubError::Value(ValueError::UnknownType { tag }))?;
-        let value = Value::decode_payload(dtype, &payload[HEADER_LEN..]).map_err(PubSubError::Value)?;
+        let dtype =
+            DType::from_u8(tag).ok_or(PubSubError::Value(ValueError::UnknownType { tag }))?;
+        let value =
+            Value::decode_payload(dtype, &payload[HEADER_LEN..]).map_err(PubSubError::Value)?;
         Ok(Self {
             topic,
             value,

@@ -359,9 +359,7 @@ impl Link {
             .ok_or(Error::Timeout {
                 context: "bulk OUT completion",
             })?;
-        completion
-            .status
-            .usb_context("sending bulk OUT frame")?;
+        completion.status.usb_context("sending bulk OUT frame")?;
         Ok(())
     }
 }

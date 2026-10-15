@@ -225,7 +225,9 @@ mod tests {
         // move, since charge and energy integrate it.
         let mut d = Decimator::new(1000, 2);
         let mut out = Vec::new();
-        let samples: Vec<f32> = (0..1000).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect();
+        let samples: Vec<f32> = (0..1000)
+            .map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })
+            .collect();
         d.process(0, &samples, &mut out);
         assert_eq!(out.len(), 1);
         assert!((out[0] - 0.5).abs() < 1e-6, "got {}", out[0]);

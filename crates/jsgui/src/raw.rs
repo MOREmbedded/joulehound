@@ -379,7 +379,10 @@ mod tests {
         t.push(&s, 0);
         let mut out = Vec::new();
         t.aggregate(0.0, 999.0 * P, 17, &mut out);
-        assert!(out.windows(2).all(|w| w[1].t > w[0].t), "times must increase");
+        assert!(
+            out.windows(2).all(|w| w[1].t > w[0].t),
+            "times must increase"
+        );
     }
 
     #[test]

@@ -93,10 +93,34 @@ const fn port(
 
 /// Description of every streaming port, indexed by `port_id - 16`.
 pub static PORT_MAP: [PortDef; PORT_COUNT] = [
-    port("s/adc/0/ctrl", "s/adc/0/!data", Signal::Adc(0), Encoding::I16, 1),
-    port("s/adc/1/ctrl", "s/adc/1/!data", Signal::Adc(1), Encoding::I16, 1),
-    port("s/adc/2/ctrl", "s/adc/2/!data", Signal::Adc(2), Encoding::I16, 1),
-    port("s/adc/3/ctrl", "s/adc/3/!data", Signal::Adc(3), Encoding::I16, 1),
+    port(
+        "s/adc/0/ctrl",
+        "s/adc/0/!data",
+        Signal::Adc(0),
+        Encoding::I16,
+        1,
+    ),
+    port(
+        "s/adc/1/ctrl",
+        "s/adc/1/!data",
+        Signal::Adc(1),
+        Encoding::I16,
+        1,
+    ),
+    port(
+        "s/adc/2/ctrl",
+        "s/adc/2/!data",
+        Signal::Adc(2),
+        Encoding::I16,
+        1,
+    ),
+    port(
+        "s/adc/3/ctrl",
+        "s/adc/3/!data",
+        Signal::Adc(3),
+        Encoding::I16,
+        1,
+    ),
     port(
         "s/i/range/ctrl",
         "s/i/range/!data",
@@ -107,12 +131,48 @@ pub static PORT_MAP: [PortDef; PORT_COUNT] = [
     port("s/i/ctrl", "s/i/!data", Signal::Current, Encoding::F32, 2),
     port("s/v/ctrl", "s/v/!data", Signal::Voltage, Encoding::F32, 2),
     port("s/p/ctrl", "s/p/!data", Signal::Power, Encoding::F32, 2),
-    port("s/gpi/0/ctrl", "s/gpi/0/!data", Signal::Gpi(0), Encoding::U1Rle, 1),
-    port("s/gpi/1/ctrl", "s/gpi/1/!data", Signal::Gpi(1), Encoding::U1Rle, 1),
-    port("s/gpi/2/ctrl", "s/gpi/2/!data", Signal::Gpi(2), Encoding::U1Rle, 1),
-    port("s/gpi/3/ctrl", "s/gpi/3/!data", Signal::Gpi(3), Encoding::U1Rle, 1),
-    port("s/gpi/7/ctrl", "s/gpi/7/!data", Signal::Gpi(7), Encoding::U1Rle, 1),
-    port("s/uart/0/ctrl", "s/uart/0/!data", Signal::Uart(0), Encoding::U8, 1),
+    port(
+        "s/gpi/0/ctrl",
+        "s/gpi/0/!data",
+        Signal::Gpi(0),
+        Encoding::U1Rle,
+        1,
+    ),
+    port(
+        "s/gpi/1/ctrl",
+        "s/gpi/1/!data",
+        Signal::Gpi(1),
+        Encoding::U1Rle,
+        1,
+    ),
+    port(
+        "s/gpi/2/ctrl",
+        "s/gpi/2/!data",
+        Signal::Gpi(2),
+        Encoding::U1Rle,
+        1,
+    ),
+    port(
+        "s/gpi/3/ctrl",
+        "s/gpi/3/!data",
+        Signal::Gpi(3),
+        Encoding::U1Rle,
+        1,
+    ),
+    port(
+        "s/gpi/7/ctrl",
+        "s/gpi/7/!data",
+        Signal::Gpi(7),
+        Encoding::U1Rle,
+        1,
+    ),
+    port(
+        "s/uart/0/ctrl",
+        "s/uart/0/!data",
+        Signal::Uart(0),
+        Encoding::U8,
+        1,
+    ),
     port(
         "s/stats/ctrl",
         "s/stats/value",
@@ -213,7 +273,9 @@ pub fn decode_f32(data: &[u8], out: &mut Vec<f32>) -> usize {
     let n = data.len() / 4;
     out.reserve(n);
     for chunk in data.chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)")));
+        out.push(f32::from_le_bytes(
+            chunk.try_into().expect("chunks_exact(4)"),
+        ));
     }
     n
 }
@@ -225,7 +287,9 @@ pub fn decode_i16(data: &[u8], out: &mut Vec<i16>) -> usize {
     let n = data.len() / 2;
     out.reserve(n);
     for chunk in data.chunks_exact(2) {
-        out.push(i16::from_le_bytes(chunk.try_into().expect("chunks_exact(2)")));
+        out.push(i16::from_le_bytes(
+            chunk.try_into().expect("chunks_exact(2)"),
+        ));
     }
     n
 }

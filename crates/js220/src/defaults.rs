@@ -11,7 +11,6 @@
 //! opened a JS220, so it is the sequence a known-working host actually sends,
 //! in order, rather than a reading of the documentation.
 
-
 use js220_proto::value::Value;
 
 /// One parameter to restore.

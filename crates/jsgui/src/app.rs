@@ -8,10 +8,10 @@ use egui_plot::{
 };
 
 use crate::acquire::{Acquisition, Command, LogLevel, Shared, Status};
-use js220::device::Source;
 use crate::buffer::{Bucket, RangeStats, SignalTrace};
 use crate::fmt;
 use crate::raw::RawTrace;
+use js220::device::Source;
 
 /// Sample rates offered in the toolbar. Every one divides 2 MHz exactly.
 const RATES: [u32; 8] = [
@@ -432,9 +432,10 @@ impl App {
                         "streaming".to_string(),
                         egui::Color32::from_rgb(120, 220, 120),
                     ),
-                    Status::Failed(e) => {
-                        (format!("error: {e}"), egui::Color32::from_rgb(240, 120, 120))
-                    }
+                    Status::Failed(e) => (
+                        format!("error: {e}"),
+                        egui::Color32::from_rgb(240, 120, 120),
+                    ),
                 };
                 ui.colored_label(colour, format!("● {text}"))
                     .on_hover_text(shared.status.label());
@@ -523,11 +524,7 @@ impl App {
             let columns = (ui.available_width() as usize).clamp(64, 4096);
 
             let coarse = [&shared.current, &shared.voltage, &shared.power];
-            let raw = [
-                &shared.raw_current,
-                &shared.raw_voltage,
-                &shared.raw_power,
-            ];
+            let raw = [&shared.raw_current, &shared.raw_voltage, &shared.raw_power];
 
             // Every plot shares one x range so the signals stay aligned, which
             // is what makes a marker meaningful across all three.
@@ -642,7 +639,9 @@ impl App {
             (Some((f, _)), _) => f,
             (None, Some((f, _))) => f,
             (None, None) => {
-                return self.view_x.unwrap_or((0.0, self.window_seconds.unwrap_or(1.0)))
+                return self
+                    .view_x
+                    .unwrap_or((0.0, self.window_seconds.unwrap_or(1.0)))
             }
         };
         let last = match (raw_span, coarse_span) {
@@ -686,7 +685,10 @@ fn describe_source(raw: &RawTrace, x: (f64, f64), columns: usize) -> (&'static s
         } else {
             (
                 "Each column shows the true minimum and maximum of the samples it covers",
-                format!("{per_column} samples/px · {} held", fmt::count(raw.len() as f64)),
+                format!(
+                    "{per_column} samples/px · {} held",
+                    fmt::count(raw.len() as f64)
+                ),
             )
         }
     } else {
@@ -764,15 +766,21 @@ fn plot_signal(
         .allow_drag(false)
         .allow_boxed_zoom(false)
         .auto_bounds(egui::Vec2b::FALSE)
-        .custom_x_axes(vec![AxisHints::new_x()
-            .formatter(|mark, _range| fmt::clock(mark.value))])
-        .custom_y_axes(vec![AxisHints::new_y()
-            .formatter(move |mark, _range| fmt::si_tick(mark.value, unit))])
+        .custom_x_axes(vec![
+            AxisHints::new_x().formatter(|mark, _range| fmt::clock(mark.value))
+        ])
+        .custom_y_axes(vec![
+            AxisHints::new_y().formatter(move |mark, _range| fmt::si_tick(mark.value, unit))
+        ])
         .label_formatter(move |name, value| {
             if name.is_empty() {
                 format!("{}\n{}", fmt::clock(value.x), fmt::si(value.y, unit))
             } else {
-                format!("{name}\n{}\n{}", fmt::clock(value.x), fmt::si(value.y, unit))
+                format!(
+                    "{name}\n{}\n{}",
+                    fmt::clock(value.x),
+                    fmt::si(value.y, unit)
+                )
             }
         });
 
@@ -1069,7 +1077,11 @@ mod tests {
     #[test]
     fn every_offered_rate_is_one_the_instrument_can_produce() {
         for r in RATES {
-            assert_eq!(js220::BASE_RATE % r, 0, "{r} Hz does not divide the base rate");
+            assert_eq!(
+                js220::BASE_RATE % r,
+                0,
+                "{r} Hz does not divide the base rate"
+            );
             match source_for(r) {
                 // Calibrated rates come from the analog ports, which stop at
                 // the 1 Msps ceiling.
@@ -1122,8 +1134,16 @@ mod tests {
 
     #[test]
     fn only_current_and_power_integrate_to_something_meaningful() {
-        assert_eq!(VIEWS[0].integral_unit, Some("C"), "current integrates to charge");
-        assert_eq!(VIEWS[2].integral_unit, Some("J"), "power integrates to energy");
+        assert_eq!(
+            VIEWS[0].integral_unit,
+            Some("C"),
+            "current integrates to charge"
+        );
+        assert_eq!(
+            VIEWS[2].integral_unit,
+            Some("J"),
+            "power integrates to energy"
+        );
         assert_eq!(VIEWS[1].integral_unit, None, "voltage does not");
     }
 
@@ -1229,7 +1249,10 @@ mod tests {
     #[test]
     fn the_span_is_found_whichever_order_the_markers_are_in() {
         let t = transform();
-        assert_eq!(grab_at(&t, (Some(60.0), Some(20.0)), at(400.0)), Some(Grab::Span));
+        assert_eq!(
+            grab_at(&t, (Some(60.0), Some(20.0)), at(400.0)),
+            Some(Grab::Span)
+        );
     }
 
     #[test]
@@ -1279,8 +1302,18 @@ mod tests {
     #[test]
     fn y_bounds_pad_the_data() {
         let b = vec![
-            Bucket { t: 0.0, min: -1.0, max: 1.0, mean: 0.0 },
-            Bucket { t: 1.0, min: -2.0, max: 3.0, mean: 0.5 },
+            Bucket {
+                t: 0.0,
+                min: -1.0,
+                max: 1.0,
+                mean: 0.0,
+            },
+            Bucket {
+                t: 1.0,
+                min: -2.0,
+                max: 3.0,
+                mean: 0.5,
+            },
         ];
         let (lo, hi) = y_bounds(&b);
         assert!(lo < -2.0 && hi > 3.0);
@@ -1288,7 +1321,12 @@ mod tests {
 
     #[test]
     fn y_bounds_give_a_flat_signal_a_band() {
-        let b = vec![Bucket { t: 0.0, min: 5.0, max: 5.0, mean: 5.0 }];
+        let b = vec![Bucket {
+            t: 0.0,
+            min: 5.0,
+            max: 5.0,
+            mean: 5.0,
+        }];
         let (lo, hi) = y_bounds(&b);
         assert!(hi > lo, "a flat signal still needs a visible band");
     }
@@ -1326,7 +1364,10 @@ mod tests {
             buckets: 1,
         };
         let text = stats_block("view", &s, &VIEWS[1], 1.0);
-        assert!(!text.contains('∫'), "voltage has no useful integral:\n{text}");
+        assert!(
+            !text.contains('∫'),
+            "voltage has no useful integral:\n{text}"
+        );
     }
 
     #[test]

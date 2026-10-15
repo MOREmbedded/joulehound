@@ -323,7 +323,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.csv");
 
-        let mut sink = Sink::spawn(&path, Format::Csv, vec![Signal::Current], 1_000_000, 4).unwrap();
+        let mut sink =
+            Sink::spawn(&path, Format::Csv, vec![Signal::Current], 1_000_000, 4).unwrap();
         sink.send(Chunk {
             sample_id: 100,
             decimate: 2,
@@ -337,7 +338,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "sample_id,time_s,current_A");
         assert!(lines[1].starts_with("100,"), "got {}", lines[1]);
-        assert!(lines[2].starts_with("102,"), "sample id advances by decimate");
+        assert!(
+            lines[2].starts_with("102,"),
+            "sample id advances by decimate"
+        );
         assert_eq!(lines.len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -349,7 +353,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cap.f32");
 
-        let mut sink = Sink::spawn(&path, Format::Bin, vec![Signal::Current], 1_000_000, 4).unwrap();
+        let mut sink =
+            Sink::spawn(&path, Format::Bin, vec![Signal::Current], 1_000_000, 4).unwrap();
         let buf = sink.take_buffer();
         assert!(buf.is_empty(), "nothing to recycle yet");
         sink.send(Chunk {

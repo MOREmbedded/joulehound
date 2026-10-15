@@ -10,8 +10,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use js220::proto::stats::Statistics;
 use js220::device::Source;
+use js220::proto::stats::Statistics;
 use js220::{Js220, Signal, StreamConfig, TransportConfig};
 
 use crate::buffer::SignalTrace;

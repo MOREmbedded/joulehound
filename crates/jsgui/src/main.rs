@@ -13,8 +13,8 @@
 mod acquire;
 mod app;
 mod buffer;
-mod raw;
 mod fmt;
+mod raw;
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,js220=info"))

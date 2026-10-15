@@ -208,7 +208,9 @@ impl StreamConfig {
             for ch in [self.adc_channels.0, self.adc_channels.1] {
                 if ch > 3 {
                     return Err(Error::Config {
-                        reason: format!("ADC channel {ch} does not exist; the instrument has 0..=3"),
+                        reason: format!(
+                            "ADC channel {ch} does not exist; the instrument has 0..=3"
+                        ),
                     });
                 }
             }
@@ -607,11 +609,12 @@ impl Js220 {
     }
 
     fn publish_raw(&mut self, topic: &str, value: Value) -> Result<()> {
-        let payload = PubSubMsg::new(topic, value)
-            .encode()
-            .ok_or_else(|| Error::MessageTooLarge {
-                topic: topic.to_owned(),
-            })?;
+        let payload =
+            PubSubMsg::new(topic, value)
+                .encode()
+                .ok_or_else(|| Error::MessageTooLarge {
+                    topic: topic.to_owned(),
+                })?;
         self.link.send_frame(frame::PORT_PUBSUB, &payload)
     }
 
@@ -832,7 +835,9 @@ impl Js220 {
             frame::PORT_LOG | frame::PORT_MEM => {
                 self.counters.ignored_frames += 1;
             }
-            p if p >= frame::PORT_STREAM_BASE => self.on_stream(p - frame::PORT_STREAM_BASE, payload),
+            p if p >= frame::PORT_STREAM_BASE => {
+                self.on_stream(p - frame::PORT_STREAM_BASE, payload)
+            }
             _ => {
                 self.counters.ignored_frames += 1;
             }

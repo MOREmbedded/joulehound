@@ -445,7 +445,10 @@ mod tests {
         t.aggregate(0.0, 50.0 * BUCKET, 10, &mut out);
         assert!(out.len() <= 10, "got {} columns", out.len());
         assert!(!out.is_empty());
-        assert!(out.windows(2).all(|w| w[1].t > w[0].t), "times must increase");
+        assert!(
+            out.windows(2).all(|w| w[1].t > w[0].t),
+            "times must increase"
+        );
     }
 
     #[test]

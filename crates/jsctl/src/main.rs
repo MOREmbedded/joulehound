@@ -85,8 +85,8 @@ impl DeviceArgs {
 
     fn open(&self) -> Result<Js220> {
         let transport = self.transport()?;
-        let dev = Js220::open_with(self.serial.as_deref(), transport)
-            .context("opening the device")?;
+        let dev =
+            Js220::open_with(self.serial.as_deref(), transport).context("opening the device")?;
         Ok(dev)
     }
 }
@@ -388,11 +388,16 @@ fn cmd_info(args: &DeviceArgs) -> Result<()> {
     values.sort_by_key(|(topic, _)| *topic);
 
     if values.is_empty() {
-        println!("
-No retained values reported.");
+        println!(
+            "
+No retained values reported."
+        );
     } else {
-        println!("
-{} retained values:", values.len());
+        println!(
+            "
+{} retained values:",
+            values.len()
+        );
         for (topic, value) in values {
             println!("  {topic:<28} {value:?}");
         }
@@ -459,9 +464,7 @@ fn cmd_topics(args: &TopicsArgs) -> Result<()> {
             }
         }
         let Some(json) = value.as_str() else { continue };
-        let current = params
-            .get(&format!("{base}?"))
-            .map(|v| format!("{v:?}"));
+        let current = params.get(&format!("{base}?")).map(|v| format!("{v:?}"));
         let described = if args.raw {
             json.replace('\n', " ")
         } else {
@@ -472,7 +475,9 @@ fn cmd_topics(args: &TopicsArgs) -> Result<()> {
     rows.sort();
 
     if rows.is_empty() {
-        println!("No matching topics. The device publishes metadata on connect; try without --filter.");
+        println!(
+            "No matching topics. The device publishes metadata on connect; try without --filter."
+        );
         return Ok(());
     }
     for (topic, described, current) in &rows {
@@ -573,7 +578,12 @@ fn interleave(rows: &Rows<'_>, out: &mut Vec<f32>) -> usize {
     if cols.is_empty() {
         return 0;
     }
-    let n = cols.iter().map(|c| c.len()).min().unwrap_or(0).min(rows.len);
+    let n = cols
+        .iter()
+        .map(|c| c.len())
+        .min()
+        .unwrap_or(0)
+        .min(rows.len);
     out.reserve(n * cols.len());
     for row in 0..n {
         for c in &cols {
@@ -724,8 +734,14 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         fmt::bytes((bytes as f64 / elapsed) as u64)
     );
     println!("bulk IN total       {}", fmt::bytes(bytes));
-    println!("transfers           {transfers} ({:.0}/s)", transfers as f64 / elapsed);
-    println!("frames              {frames} ({:.0}/s)", frames as f64 / elapsed);
+    println!(
+        "transfers           {transfers} ({:.0}/s)",
+        transfers as f64 / elapsed
+    );
+    println!(
+        "frames              {frames} ({:.0}/s)",
+        frames as f64 / elapsed
+    );
     println!(
         "aligned rows        {rows_total} ({:.0}/s, requested {rate}/s)",
         rows_total as f64 / elapsed
@@ -821,7 +837,10 @@ mod tests {
 
     #[test]
     fn an_unknown_signal_is_rejected_by_name() {
-        let err = stream_args("i,q", 1_000_000).signals().unwrap_err().to_string();
+        let err = stream_args("i,q", 1_000_000)
+            .signals()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("\"q\""), "got {err}");
     }
 

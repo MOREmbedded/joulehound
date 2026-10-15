@@ -93,13 +93,28 @@ window into the coarse buffer.
 Each column is stroked from its minimum to its maximum, so a single-sample
 spike stays visible however far out you are, with the mean drawn over the top.
 
-**Scaling.** Both axes pan and zoom at any time. Each plot has a *Follow*
-toggle that tracks the newest data and auto-scales Y; grabbing a plot releases
-only that one, and *Fit* resumes. A view the data has scrolled past snaps back
-to the live edge rather than stranding you on an empty plot.
+**Two acquisition paths.** The rate list runs 1 kHz to 1 MHz for calibrated
+amperes and volts, and ends with **2 MHz raw ADC**. The instrument caps
+calibrated output at 1 Msps because its analog ports decimate the 2 MHz
+counter by two; the raw ADC ports do not, so they reach the full rate. Raw
+samples are uncalibrated counts with no gain, offset or range correction
+applied, so the plots relabel to ADC 0 and ADC 1, power disappears — counts
+cannot be multiplied into watts — and no integral is offered. It is for seeing
+fast edges, not for measuring. `jsctl --source raw` does the same from the
+command line.
+
+**Scaling.** Both axes pan and zoom at any time, with the wheel zooming about
+the pointer; shift restricts it to time and ctrl to the value axis. Each plot
+has its own *Follow* (track the newest data) and *Auto Y* (scale to what is on
+screen), kept independent so a Y zoom does not stop the trace tracking live
+data and following live data does not stamp out a Y zoom. *Fit* turns both back
+on. A view the data has scrolled past snaps back to the live edge rather than
+stranding you on an empty plot.
 
 **Markers.** `A|B` places a pair, `A` places one, `✖` clears them. They are
-dragged directly in any plot and appear at the same instant in all of them.
+dragged directly in any plot and appear at the same instant in all of them;
+dragging *between* a pair moves both rigidly, which is how a measurement window
+is positioned once its width is right.
 Each is labelled with the value underneath it, and the span's statistics are
 drawn beside it inside the plot — avg, std, rms, min, max, p2p, and the time
 integral where one is meaningful, so current integrates to charge and power to
@@ -192,6 +207,7 @@ round-tripping through real files.
 | Sustained bulk IN | **7.75 MiB/s** |
 | Rate achieved, 1 Msps | **99.99–100.00%** of requested, measured from real samples |
 | Rates 1 k / 10 k / 100 k / 200 k / 500 k / 1 M | 100% on most runs; an occasional run lands lower (one 200 kHz run measured 84%) |
+| Raw ADC, 2 Msps | **1,999,875 samples/s — 99.99%**, at the same 7.75 MiB/s, since i16 at twice the rate is the same bytes as f32 |
 | Statistics | 2 Hz blocks arriving on time, charge and energy accumulating monotonically |
 | Frame integrity | 0 undecodable, 0 sequence breaks |
 | Gap fill | ~126 NaN samples per run, all at stream startup |
