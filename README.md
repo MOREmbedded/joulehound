@@ -80,32 +80,36 @@ jsgui           # pick a device and press Start
 jsgui --start   # begin streaming immediately
 ```
 
-Three stacked plots share a time axis: current, voltage and power. Each is
-drawn as a **min/max envelope with the mean overlaid**, so a single-sample
-spike is still visible when one pixel column covers thousands of samples —
-which a plain decimated plot would hide entirely.
+![jsgui](docs/jsgui.png)
 
-**Scaling.** Both axes pan and zoom at any time: drag to pan, wheel to zoom.
-Each plot has its own *Follow* toggle, which keeps the newest data in view and
-auto-scales Y to what is actually on screen. Taking hold of a plot turns Follow
-off for that plot alone, so the view never fights you; *Fit* resumes it. The
-toolbar's window selector chooses how much history is shown while following,
-and *Auto-fit* resumes following everywhere.
+**Resolution follows the view.** Recent samples are retained raw and aggregated
+to whatever range is on screen, so zooming in reveals the real waveform down to
+individual samples. Aggregating once at capture time would be cheaper, but the
+detail would be gone for good and a 1 Msps signal would read as a solid block
+at every zoom. The badge on each plot says what you are looking at: `raw`, or
+how many samples each column covers, or `history` once you pan beyond the raw
+window into the coarse buffer.
 
-**Markers.** *Set A* and *Set B* place two markers, which appear at the same
-time position in all three plots. The panel then reports, per signal, the value
-at A, the value at B, the difference, the mean between them, and the minimum,
-maximum and peak-to-peak over the span — plus Δt, 1/Δt, and the charge and
-energy accumulated between the markers. The *↔A* and *↔B* buttons arm a marker
-so clicking or dragging in a plot repositions it.
+Each column is stroked from its minimum to its maximum, so a single-sample
+spike stays visible however far out you are, with the mean drawn over the top.
+
+**Scaling.** Both axes pan and zoom at any time. Each plot has a *Follow*
+toggle that tracks the newest data and auto-scales Y; grabbing a plot releases
+only that one, and *Fit* resumes. A view the data has scrolled past snaps back
+to the live edge rather than stranding you on an empty plot.
+
+**Markers.** `A|B` places a pair, `A` places one, `✖` clears them. They are
+dragged directly in any plot and appear at the same instant in all of them.
+Each is labelled with the value underneath it, and the span's statistics are
+drawn beside it inside the plot — avg, std, rms, min, max, p2p, and the time
+integral where one is meaningful, so current integrates to charge and power to
+energy but voltage gets none.
 
 **Recording** writes the same interleaved little-endian `f32` format `jsctl`
 produces, so the two are interchangeable.
 
 The acquisition thread owns the device and never blocks on rendering: a host
 that stops draining the bulk IN queue makes the *device* drop samples silently.
-Samples are folded into display buckets as they arrive, so the GUI only ever
-handles a few thousand points per signal no matter the sample rate.
 
 ## Design
 
