@@ -77,8 +77,9 @@ pub struct App {
     view_y: [Option<(f64, f64)>; VIEWS.len()],
     /// Which signals are plotted at all.
     visible: [bool; VIEWS.len()],
-    /// Seconds of history shown while following.
-    window_seconds: f64,
+    /// Seconds of history shown while following, or None to accumulate the
+    /// whole capture the way the instrument software does.
+    window_seconds: Option<f64>,
     /// The x range each plot is showing, carried between frames so the data
     /// can be aggregated to the view before it is drawn.
     view_x: Option<(f64, f64)>,
@@ -115,7 +116,7 @@ impl App {
             auto_y: [true; VIEWS.len()],
             view_y: [None; VIEWS.len()],
             visible: [true; VIEWS.len()],
-            window_seconds: 1.0,
+            window_seconds: None,
             view_x: None,
             marker_a: None,
             marker_b: None,
@@ -235,10 +236,19 @@ impl App {
                 let before = self.window_seconds;
                 egui::ComboBox::from_id_salt("window")
                     .width(76.0)
-                    .selected_text(fmt::seconds(self.window_seconds))
+                    .selected_text(match self.window_seconds {
+                        Some(w) => fmt::seconds(w),
+                        None => "All".to_string(),
+                    })
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.window_seconds, None, "All")
+                            .on_hover_text("Accumulate the whole capture");
                         for w in WINDOWS {
-                            ui.selectable_value(&mut self.window_seconds, w, fmt::seconds(w));
+                            ui.selectable_value(
+                                &mut self.window_seconds,
+                                Some(w),
+                                fmt::seconds(w),
+                            );
                         }
                     });
                 if self.window_seconds != before {
@@ -248,11 +258,19 @@ impl App {
                     self.follow = [true; VIEWS.len()];
                 }
                 if ui.button("🔍−").on_hover_text("Show more time").clicked() {
-                    self.window_seconds = (self.window_seconds * 2.0).min(60.0);
+                    self.window_seconds = match self.window_seconds {
+                        // Widening past the longest span is the whole capture.
+                        Some(w) if w >= 60.0 => None,
+                        Some(w) => Some(w * 2.0),
+                        None => None,
+                    };
                     self.follow = [true; VIEWS.len()];
                 }
                 if ui.button("🔍+").on_hover_text("Show less time").clicked() {
-                    self.window_seconds = (self.window_seconds / 2.0).max(1e-4);
+                    let current = self.window_seconds.unwrap_or_else(|| {
+                        self.view_x.map_or(1.0, |(lo, hi)| hi - lo)
+                    });
+                    self.window_seconds = Some((current / 2.0).max(1e-4));
                     self.follow = [true; VIEWS.len()];
                 }
                 if ui
@@ -509,9 +527,22 @@ impl App {
     /// live edge. Leaving it would show an empty plot with no obvious way out,
     /// which is worse than losing the position.
     fn resolve_x_range(&mut self, raw: &RawTrace, coarse: &SignalTrace) -> (f64, f64) {
-        let available = raw.time_span().or_else(|| coarse.time_span());
-        let Some((first, last)) = available else {
-            return self.view_x.unwrap_or((0.0, self.window_seconds));
+        // The oldest data lives in the coarse history, which reaches back
+        // minutes; the raw ring only holds the last few seconds. Taking the
+        // start from raw would make "All" show those few seconds and sweep
+        // exactly like a fixed window.
+        let (raw_span, coarse_span) = (raw.time_span(), coarse.time_span());
+        let first = match (coarse_span, raw_span) {
+            (Some((f, _)), _) => f,
+            (None, Some((f, _))) => f,
+            (None, None) => {
+                return self.view_x.unwrap_or((0.0, self.window_seconds.unwrap_or(1.0)))
+            }
+        };
+        let last = match (raw_span, coarse_span) {
+            (Some((_, l)), _) => l,
+            (None, Some((_, l))) => l,
+            (None, None) => first,
         };
         if !self.follow.iter().any(|f| *f) {
             if let Some((lo, hi)) = self.view_x {
@@ -522,7 +553,13 @@ impl App {
                 self.follow = [true; VIEWS.len()];
             }
         }
-        (last - self.window_seconds, last)
+        match self.window_seconds {
+            // Accumulate: grow from the start of the capture, the way the
+            // instrument software does, rather than sliding a fixed window
+            // so the trace appears to sweep past forever.
+            None => (first, last.max(first + 1e-6)),
+            Some(w) => ((last - w).max(first), last),
+        }
     }
 }
 
@@ -570,8 +607,7 @@ fn aggregate_for_view(
     }
     out.clear();
     if !coarse.is_empty() {
-        out.reserve(coarse.len());
-        out.extend(coarse.iter().filter(|b| !b.is_empty()));
+        coarse.aggregate(x.0, x.1, columns, out);
     }
 }
 

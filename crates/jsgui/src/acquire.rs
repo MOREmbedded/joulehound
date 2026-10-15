@@ -22,12 +22,18 @@ const POLL: Duration = Duration::from_millis(50);
 /// Maximum log lines retained.
 const LOG_LIMIT: usize = 400;
 
-/// Display buckets retained per signal, roughly one per horizontal pixel of a
-/// wide window with room to scroll back.
-pub const BUCKETS: usize = 4000;
+/// Resolution of the long history, in seconds per bucket.
+///
+/// Fine enough that a millisecond-scale feature still shows when the whole
+/// capture is on screen, coarse enough that minutes of history cost little.
+pub const HISTORY_BUCKET_SECONDS: f64 = 0.0025;
 
-/// Seconds of history the coarse traces aim to cover.
-pub const WINDOW_SECONDS: f64 = 10.0;
+/// Display buckets retained per signal.
+///
+/// At the bucket resolution above this is about eleven minutes of history for
+/// 4 MB per signal, which is what lets the view accumulate from the start of
+/// the capture instead of sliding a fixed window over it.
+pub const BUCKETS: usize = 256 * 1024;
 
 /// Raw samples retained per signal for zooming into the real waveform.
 ///
@@ -437,12 +443,12 @@ fn finish_recording(mut rec: Recorder, shared: &Arc<Mutex<Shared>>, started: Ins
 
 /// Display bucket width for a given rate.
 ///
-/// The window is divided evenly into buckets so the trace covers the same span
-/// at any rate, with a floor of one sample per bucket so low rates are not
-/// aggregated below their own resolution.
+/// Fixed, with a floor of one sample per bucket so a low rate is never
+/// aggregated below its own resolution. Holding the resolution constant means
+/// the history covers a predictable span of time whatever the sample rate.
 fn bucket_seconds_for(rate: u32) -> f64 {
     let sample_period = 1.0 / rate.max(1) as f64;
-    (WINDOW_SECONDS / BUCKETS as f64).max(sample_period)
+    HISTORY_BUCKET_SECONDS.max(sample_period)
 }
 
 fn start_session(serial: Option<&str>, rate: u32, statistics: bool) -> js220::Result<Session> {
@@ -575,11 +581,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_window_is_divided_evenly_regardless_of_rate() {
-        let expected = WINDOW_SECONDS / BUCKETS as f64;
-        for rate in [10_000, 100_000, 1_000_000] {
+    fn history_resolution_is_the_same_at_every_usable_rate() {
+        for rate in [1_000, 10_000, 100_000, 1_000_000] {
             assert!(
-                (bucket_seconds_for(rate) - expected).abs() < 1e-12,
+                (bucket_seconds_for(rate) - HISTORY_BUCKET_SECONDS).abs() < 1e-12,
                 "rate {rate}"
             );
         }
@@ -594,10 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn a_full_window_fits_the_bucket_ring() {
-        // The ring must be able to hold the whole intended window.
-        let buckets = WINDOW_SECONDS / bucket_seconds_for(1_000_000);
-        assert!(buckets <= BUCKETS as f64, "{buckets} buckets needed");
+    fn the_history_spans_minutes_not_seconds() {
+        // Accumulating from the start of a capture is only useful if the
+        // history actually reaches back that far.
+        let span = BUCKETS as f64 * bucket_seconds_for(1_000_000);
+        assert!(span > 600.0, "only {span} s of history");
     }
 
     #[test]

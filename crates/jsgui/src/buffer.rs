@@ -212,6 +212,48 @@ impl SignalTrace {
     }
 
     /// Time span covered, in seconds.
+    /// Fold the buckets in `t0..=t1` into at most `columns` output buckets.
+    ///
+    /// The history holds hundreds of thousands of buckets so that the view can
+    /// accumulate over minutes; handing all of them to the plot would stall
+    /// it. Extremes are carried through from the source buckets, so a spike
+    /// survives this second round of aggregation as well.
+    pub fn aggregate(&self, t0: f64, t1: f64, columns: usize, out: &mut Vec<Bucket>) {
+        out.clear();
+        if columns == 0 {
+            return;
+        }
+        let (lo, hi) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+        // NaN bounds fail the finite check first, so the comparison below
+        // only ever sees ordered values.
+        let span = hi - lo;
+        if !span.is_finite() || span <= 0.0 {
+            return;
+        }
+
+        // One pass, writing each source bucket into the column it falls in.
+        out.reserve(columns.min(self.len()));
+        let mut acc: Vec<Option<Bucket>> = vec![None; columns];
+        for b in self.iter() {
+            if b.is_empty() || b.t < lo || b.t > hi {
+                continue;
+            }
+            let c = (((b.t - lo) / span) * columns as f64) as usize;
+            let c = c.min(columns - 1);
+            match &mut acc[c] {
+                Some(a) => {
+                    a.min = a.min.min(b.min);
+                    a.max = a.max.max(b.max);
+                    // Midpoint of the means is close enough at this density,
+                    // and avoids carrying a count per column.
+                    a.mean = (a.mean + b.mean) * 0.5;
+                }
+                slot => *slot = Some(b),
+            }
+        }
+        out.extend(acc.into_iter().flatten());
+    }
+
     /// Aggregate every bucket between `t0` and `t1`, in either order.
     ///
     /// This is what a pair of markers measures: the extremes are the true
@@ -390,6 +432,48 @@ mod tests {
         let (first, last) = t.time_span().unwrap();
         assert!(first < last);
         assert!((last - first - 2.0 * BUCKET).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggregate_folds_history_into_the_requested_columns() {
+        let mut t = SignalTrace::new(100);
+        for i in 0..50u64 {
+            t.extend(&[i as f32; 1000], i * 1000, PERIOD, BUCKET);
+        }
+        t.finish(BUCKET);
+        let mut out = Vec::new();
+        t.aggregate(0.0, 50.0 * BUCKET, 10, &mut out);
+        assert!(out.len() <= 10, "got {} columns", out.len());
+        assert!(!out.is_empty());
+        assert!(out.windows(2).all(|w| w[1].t > w[0].t), "times must increase");
+    }
+
+    #[test]
+    fn aggregate_carries_extremes_through_the_second_fold() {
+        let mut t = SignalTrace::new(100);
+        let mut spike = vec![0.0f32; 1000];
+        spike[10] = 77.0;
+        t.extend(&spike, 0, PERIOD, BUCKET);
+        for i in 1..20u64 {
+            t.extend(&[0.0; 1000], i * 1000, PERIOD, BUCKET);
+        }
+        t.finish(BUCKET);
+        let mut out = Vec::new();
+        t.aggregate(0.0, 20.0 * BUCKET, 4, &mut out);
+        let peak = out.iter().map(|b| b.max).fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(peak, 77.0, "the spike must survive re-aggregation");
+    }
+
+    #[test]
+    fn aggregate_of_a_degenerate_span_is_empty() {
+        let mut t = SignalTrace::new(10);
+        t.extend(&[1.0; 1000], 0, PERIOD, BUCKET);
+        t.finish(BUCKET);
+        let mut out = Vec::new();
+        t.aggregate(1.0, 1.0, 10, &mut out);
+        assert!(out.is_empty());
+        t.aggregate(0.0, 1.0, 0, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
