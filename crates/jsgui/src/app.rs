@@ -66,8 +66,15 @@ pub struct App {
     statistics: bool,
     record_path: String,
     show_log: bool,
-    /// Per-plot: keep the newest data in view and auto-scale Y.
+    /// Keep the newest data in view. Shared, because the plots share one
+    /// time axis.
     follow: [bool; VIEWS.len()],
+    /// Per-plot: scale Y to the data in view. Independent of `follow`, so
+    /// zooming Y does not stop the trace tracking live data, and following
+    /// live data does not stamp out a Y zoom.
+    auto_y: [bool; VIEWS.len()],
+    /// Per-plot Y range, owned here rather than by the plot widget.
+    view_y: [Option<(f64, f64)>; VIEWS.len()],
     /// Which signals are plotted at all.
     visible: [bool; VIEWS.len()],
     /// Seconds of history shown while following.
@@ -105,6 +112,8 @@ impl App {
             record_path: default_record_path(),
             show_log: false,
             follow: [true; VIEWS.len()],
+            auto_y: [true; VIEWS.len()],
+            view_y: [None; VIEWS.len()],
             visible: [true; VIEWS.len()],
             window_seconds: 1.0,
             view_x: None,
@@ -422,10 +431,18 @@ impl App {
                     ui.colored_label(view.colour, egui::RichText::new(view.name).strong());
                     ui.weak(format!("({})", view.unit));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Fit").on_hover_text("Resume following").clicked() {
+                        if ui
+                            .button("Fit")
+                            .on_hover_text("Track live data and scale Y to it")
+                            .clicked()
+                        {
                             self.follow[i] = true;
+                            self.auto_y[i] = true;
                         }
-                        ui.toggle_value(&mut self.follow[i], "Follow");
+                        ui.toggle_value(&mut self.auto_y[i], "Auto Y")
+                            .on_hover_text("Scale Y to the data in view");
+                        ui.toggle_value(&mut self.follow[i], "Follow")
+                            .on_hover_text("Keep the newest data in view");
                         // Say where the plotted points came from, so a coarse
                         // trace is never mistaken for the real waveform.
                         let (source, detail) = describe_source(raw[i], x_range, columns);
@@ -434,6 +451,18 @@ impl App {
                 });
 
                 aggregate_for_view(raw[i], coarse[i], x_range, columns, &mut self.buckets);
+                // Y is auto-scaled to what is on screen unless the user has
+                // taken it over, in which case their range is preserved.
+                let y_range = if self.auto_y[i] {
+                    let y = y_bounds(&self.buckets);
+                    self.view_y[i] = Some(y);
+                    y
+                } else {
+                    let y = self.view_y[i].unwrap_or_else(|| y_bounds(&self.buckets));
+                    self.view_y[i] = Some(y);
+                    y
+                };
+
                 let outcome = plot_signal(
                     ui,
                     view,
@@ -442,16 +471,21 @@ impl App {
                     coarse[i],
                     height,
                     x_range,
+                    y_range,
                     (self.marker_a, self.marker_b),
                     self.dragging,
                 );
 
-                if outcome.interacted {
-                    log::debug!("follow cleared by {} on {}", outcome.reason, view.name);
+                if let Some(x) = outcome.new_x {
+                    // Panning or zooming time stops the trace chasing the
+                    // live edge, on every plot, since they share the axis.
                     self.follow = [false; VIEWS.len()];
+                    self.view_x = Some(x);
                 }
-                if let Some(bounds) = outcome.bounds {
-                    self.view_x = Some(bounds);
+                if let Some(y) = outcome.new_y {
+                    // Y is this plot's alone.
+                    self.auto_y[i] = false;
+                    self.view_y[i] = Some(y);
                 }
                 if let Some((marker, t)) = outcome.drag {
                     self.dragging = Some(marker);
@@ -548,10 +582,11 @@ fn span_stats(raw: &RawTrace, coarse: &SignalTrace, a: f64, b: f64) -> Option<Ra
 
 /// What the user did to a plot this frame.
 struct PlotOutcome {
-    interacted: bool,
-    /// Why `interacted` was set, for diagnosing spurious takeovers.
-    reason: &'static str,
-    bounds: Option<(f64, f64)>,
+    /// A time range the user panned or zoomed to.
+    new_x: Option<(f64, f64)>,
+    /// A Y range the user panned or zoomed to.
+    new_y: Option<(f64, f64)>,
+    /// A marker the user is positioning.
     drag: Option<(Marker, f64)>,
 }
 
@@ -567,6 +602,7 @@ fn plot_signal(
     coarse: &SignalTrace,
     height: f32,
     x: (f64, f64),
+    y: (f64, f64),
     markers: (Option<f64>, Option<f64>),
     dragging: Option<Marker>,
 ) -> PlotOutcome {
@@ -574,10 +610,15 @@ fn plot_signal(
     let plot = Plot::new(view.name)
         .height(height.max(70.0))
         .legend(Legend::default())
-        .allow_zoom(true)
-        .allow_scroll(true)
-        .allow_drag(true)
-        .allow_boxed_zoom(true)
+        // The viewport is driven from here rather than by the widget. Letting
+        // the widget pan and zoom as well means it applies the gesture and
+        // this code overwrites it on the same frame, so an axis being
+        // auto-scaled simply refuses to move. That is why Y could not be
+        // zoomed at all.
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .allow_drag(false)
+        .allow_boxed_zoom(false)
         .auto_bounds(egui::Vec2b::FALSE)
         .custom_x_axes(vec![AxisHints::new_x()
             .formatter(|mark, _range| fmt::clock(mark.value))])
@@ -591,13 +632,8 @@ fn plot_signal(
             }
         });
 
-    let mut drag = None;
-
     let response = plot.show(ui, |plot_ui| {
-        // Drive the x range; Y is scaled to what is actually in view so a
-        // spike that has scrolled away stops squashing the trace.
-        let (y_min, y_max) = y_bounds(buckets);
-        plot_ui.set_plot_bounds(PlotBounds::from_min_max([x.0, y_min], [x.1, y_max]));
+        plot_ui.set_plot_bounds(PlotBounds::from_min_max([x.0, y.0], [x.1, y.1]));
 
         if !buckets.is_empty() {
             let mut upper: Vec<[f64; 2]> = Vec::with_capacity(buckets.len());
@@ -608,8 +644,6 @@ fn plot_signal(
                 lower.push([b.t, b.min as f64]);
                 mean.push([b.t, b.mean as f64]);
             }
-            // The envelope only means something when a column covers more
-            // than one sample; drawn always, it just thickens the trace.
             let spread = upper
                 .iter()
                 .zip(&lower)
@@ -630,9 +664,6 @@ fn plot_signal(
             );
         }
 
-        // Markers: a shaded span between a pair, and the statistics for
-        // whatever span is in force, drawn beside it as the instrument's own
-        // software does.
         let bounds = plot_ui.plot_bounds();
         if let (Some(a), Some(b)) = markers {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -648,14 +679,9 @@ fn plot_signal(
                 .stroke(egui::Stroke::NONE),
             );
         }
-        for (t, name, colour) in [
-            (markers.0, "A", MARKER_A),
-            (markers.1, "B", MARKER_B),
-        ] {
+        for (t, name, colour) in [(markers.0, "A", MARKER_A), (markers.1, "B", MARKER_B)] {
             let Some(t) = t else { continue };
             plot_ui.vline(VLine::new(t).name(name).color(colour).width(1.4_f32));
-            // The instantaneous value under the marker, which is what the
-            // line is pointing at.
             if let Some(v) = raw.value_at(t) {
                 plot_ui.text(
                     Text::new(
@@ -677,8 +703,7 @@ fn plot_signal(
             if let Some(stats) = span_stats(raw, coarse, a, b) {
                 let text = stats_block(&label, &stats, view, (b - a).abs());
                 // Inset far enough to clear the Y axis labels, which egui
-                // draws inside the plot area and would otherwise overlap the
-                // first characters of every line.
+                // draws inside the plot area.
                 let pos = PlotPoint::new(
                     bounds.min()[0] + (bounds.max()[0] - bounds.min()[0]) * 0.055,
                     bounds.max()[1],
@@ -692,41 +717,91 @@ fn plot_signal(
         }
     });
 
-    // Markers are dragged directly: grab the one under the pointer, or keep
-    // moving the one already held.
+    interact(ui, &response, x, y, markers, dragging)
+}
+
+/// Apply the pan and zoom gestures to the ranges this code owns.
+///
+/// Zooming scales about the pointer so whatever is under the cursor stays
+/// put, which is what makes zooming feel aimed rather than arbitrary. Holding
+/// shift restricts a wheel zoom to time, ctrl to the value axis; unmodified it
+/// zooms both.
+fn interact(
+    ui: &egui::Ui,
+    response: &egui_plot::PlotResponse<()>,
+    x: (f64, f64),
+    y: (f64, f64),
+    markers: (Option<f64>, Option<f64>),
+    dragging: Option<Marker>,
+) -> PlotOutcome {
     let r = &response.response;
-    if let Some(pos) = r.interact_pointer_pos() {
-        if r.dragged() {
-            let t = response.transform.value_from_position(pos).x;
+    let mut out = PlotOutcome {
+        new_x: None,
+        new_y: None,
+        drag: None,
+    };
+
+    // The press must have begun on this plot, so the synthetic pointer events
+    // a window move or resize produces cannot be mistaken for a gesture.
+    let gesture = r.dragged() && r.is_pointer_button_down_on();
+
+    // A marker under the pointer takes the drag; the view stays put.
+    if gesture {
+        if let Some(pos) = r.interact_pointer_pos() {
             let held = dragging.or_else(|| nearest_marker(&response.transform, markers, pos));
             if let Some(m) = held {
-                drag = Some((m, t));
+                out.drag = Some((m, response.transform.value_from_position(pos).x));
+                return out;
             }
         }
     }
 
-    // Taking over the view needs a press that began on this plot and then
-    // moved. `dragged()` alone also fires for the synthetic pointer events a
-    // window move or resize produces, which silently stranded the plot on a
-    // range the data had long since left.
-    let held = r.is_pointer_button_down_on();
-    let panned = held && r.dragged() && drag.is_none() && r.drag_delta().length() > 0.0;
-    let scrolled = r.hovered() && ui.input(|i| i.raw_scroll_delta.y.abs() > 0.0);
-    let bounds = response.transform.bounds();
-
-    let reason = if panned {
-        "drag"
-    } else if scrolled {
-        "scroll"
-    } else {
-        ""
-    };
-    PlotOutcome {
-        interacted: panned || scrolled,
-        reason,
-        bounds: Some((bounds.min()[0], bounds.max()[0])),
-        drag,
+    if gesture {
+        let d = r.drag_delta();
+        if d.length() > 0.0 {
+            let per_px = response.transform.dvalue_dpos();
+            let dx = d.x as f64 * per_px[0];
+            let dy = d.y as f64 * per_px[1];
+            out.new_x = Some((x.0 - dx, x.1 - dx));
+            out.new_y = Some((y.0 - dy, y.1 - dy));
+            return out;
+        }
     }
+
+    let scroll = ui.input(|i| i.raw_scroll_delta.y);
+    if r.hovered() && scroll.abs() > 0.0 {
+        let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+        let factor = (-scroll as f64 * 0.0015).exp();
+        let anchor = r
+            .hover_pos()
+            .map(|p| response.transform.value_from_position(p));
+        let (ax, ay) = match anchor {
+            Some(p) => (p.x, p.y),
+            None => ((x.0 + x.1) * 0.5, (y.0 + y.1) * 0.5),
+        };
+        if !ctrl {
+            out.new_x = Some(zoom_about(x, ax, factor));
+        }
+        if !shift {
+            out.new_y = Some(zoom_about(y, ay, factor));
+        }
+    }
+
+    out
+}
+
+/// Scale `range` by `factor` while keeping `anchor` at the same position.
+fn zoom_about(range: (f64, f64), anchor: f64, factor: f64) -> (f64, f64) {
+    let width = range.1 - range.0;
+    if width <= 0.0 || !factor.is_finite() || factor <= 0.0 {
+        return range;
+    }
+    // A hard floor stops repeated zooming collapsing the range to nothing,
+    // which would leave the plot undrawable with no way back.
+    let new_width = (width * factor).clamp(1e-9, 1e9);
+    let frac = ((anchor - range.0) / width).clamp(0.0, 1.0);
+    let lo = anchor - frac * new_width;
+    (lo, lo + new_width)
 }
 
 /// The marker within grabbing distance of `pos`, if any.
@@ -872,6 +947,50 @@ mod tests {
     #[test]
     fn the_envelope_of_nothing_is_empty() {
         assert!(envelope_zigzag(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn zooming_keeps_the_anchor_under_the_pointer() {
+        // Zoom out by 2x about the midpoint: the range doubles around it.
+        let (lo, hi) = zoom_about((0.0, 10.0), 5.0, 2.0);
+        assert!((lo + 5.0).abs() < 1e-9, "lo {lo}");
+        assert!((hi - 15.0).abs() < 1e-9, "hi {hi}");
+        // The anchor stays at the same fraction of the range, which is what
+        // keeps the point under the cursor still.
+        assert!(((5.0 - lo) / (hi - lo) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zooming_about_an_edge_holds_that_edge() {
+        let (lo, hi) = zoom_about((0.0, 10.0), 0.0, 0.5);
+        assert!((lo - 0.0).abs() < 1e-9, "the left edge must not move: {lo}");
+        assert!((hi - 5.0).abs() < 1e-9, "hi {hi}");
+    }
+
+    #[test]
+    fn zooming_out_widens_and_in_narrows() {
+        let out = zoom_about((0.0, 1.0), 0.5, 4.0);
+        assert!(out.1 - out.0 > 1.0);
+        let inn = zoom_about((0.0, 1.0), 0.5, 0.25);
+        assert!(inn.1 - inn.0 < 1.0);
+    }
+
+    #[test]
+    fn zooming_cannot_collapse_the_range() {
+        // Repeated aggressive zoom must leave something drawable.
+        let mut r = (0.0, 1.0);
+        for _ in 0..200 {
+            r = zoom_about(r, 0.5, 0.1);
+        }
+        assert!(r.1 - r.0 > 0.0, "range collapsed to {r:?}");
+        assert!((r.1 - r.0).is_finite());
+    }
+
+    #[test]
+    fn zooming_rejects_a_degenerate_range_or_factor() {
+        assert_eq!(zoom_about((1.0, 1.0), 1.0, 2.0), (1.0, 1.0));
+        assert_eq!(zoom_about((0.0, 1.0), 0.5, 0.0), (0.0, 1.0));
+        assert_eq!(zoom_about((0.0, 1.0), 0.5, f64::NAN), (0.0, 1.0));
     }
 
     #[test]
