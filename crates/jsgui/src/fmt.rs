@@ -94,9 +94,24 @@ pub fn si_tick(value: f64, unit: &str) -> String {
     format!("{value:.1e} {unit}")
 }
 
+/// Format a time position as `m:ss.mmm`, the axis format the instrument's own
+/// software uses, falling back to seconds for very short spans.
+pub fn clock(t: f64) -> String {
+    if !t.is_finite() {
+        return "—".into();
+    }
+    let sign = if t < 0.0 { "-" } else { "" };
+    let a = t.abs();
+    let minutes = (a / 60.0).floor() as u64;
+    let seconds = a - minutes as f64 * 60.0;
+    format!("{sign}{minutes}:{seconds:06.3}")
+}
+
 /// Format a time span for the window selector.
 pub fn seconds(s: f64) -> String {
-    if s < 1.0 {
+    if s < 0.001 {
+        format!("{:.0} us", s * 1e6)
+    } else if s < 1.0 {
         format!("{:.0} ms", s * 1000.0)
     } else {
         format!("{s:.0} s")
@@ -200,7 +215,17 @@ mod tests {
     }
 
     #[test]
+    fn clock_renders_minutes_and_seconds() {
+        assert_eq!(clock(0.0), "0:00.000");
+        assert_eq!(clock(63.25), "1:03.250");
+        assert_eq!(clock(600.5), "10:00.500");
+        assert_eq!(clock(-1.5), "-0:01.500");
+        assert_eq!(clock(f64::NAN), "—");
+    }
+
+    #[test]
     fn spans_render_in_sensible_units() {
+        assert_eq!(seconds(0.0001), "100 us");
         assert_eq!(seconds(0.1), "100 ms");
         assert_eq!(seconds(0.5), "500 ms");
         assert_eq!(seconds(2.0), "2 s");

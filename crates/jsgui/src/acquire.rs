@@ -14,6 +14,7 @@ use js220::proto::stats::Statistics;
 use js220::{Js220, Signal, StreamConfig, TransportConfig};
 
 use crate::buffer::SignalTrace;
+use crate::raw::RawTrace;
 
 /// How long a single poll blocks before the loop checks for commands.
 const POLL: Duration = Duration::from_millis(50);
@@ -25,8 +26,15 @@ const LOG_LIMIT: usize = 400;
 /// wide window with room to scroll back.
 pub const BUCKETS: usize = 4000;
 
-/// Seconds of history the traces aim to cover.
+/// Seconds of history the coarse traces aim to cover.
 pub const WINDOW_SECONDS: f64 = 10.0;
+
+/// Raw samples retained per signal for zooming into the real waveform.
+///
+/// Bounded in samples rather than seconds so the memory cost is fixed at any
+/// sample rate: 4 M samples is 16 MB per signal, and covers four seconds at
+/// the 1 Msps ceiling or far longer at lower rates.
+pub const RAW_SAMPLES: usize = 4 << 20;
 
 /// Commands the GUI sends to the acquisition thread.
 #[derive(Debug, Clone)]
@@ -95,6 +103,12 @@ pub struct Shared {
     pub voltage: SignalTrace,
     /// Aggregated power trace, in watts.
     pub power: SignalTrace,
+    /// Recent raw current samples, for zooming in.
+    pub raw_current: RawTrace,
+    /// Recent raw voltage samples.
+    pub raw_voltage: RawTrace,
+    /// Recent raw power samples.
+    pub raw_power: RawTrace,
     /// Most recent on-instrument statistics.
     pub statistics: Option<Statistics>,
     /// Sustained bulk IN rate in bytes per second.
@@ -153,6 +167,9 @@ impl Shared {
             current: SignalTrace::new(buckets),
             voltage: SignalTrace::new(buckets),
             power: SignalTrace::new(buckets),
+            raw_current: RawTrace::new(RAW_SAMPLES),
+            raw_voltage: RawTrace::new(RAW_SAMPLES),
+            raw_power: RawTrace::new(RAW_SAMPLES),
             statistics: None,
             throughput: 0.0,
             sample_rate: 0.0,
@@ -184,6 +201,20 @@ impl Shared {
         self.current.clear();
         self.voltage.clear();
         self.power.clear();
+        self.raw_current.clear();
+        self.raw_voltage.clear();
+        self.raw_power.clear();
+    }
+
+    /// Point the raw traces at a new sample rate, discarding what they hold.
+    fn reconfigure_raw(&mut self, sample_period: f64) {
+        for t in [
+            &mut self.raw_current,
+            &mut self.raw_voltage,
+            &mut self.raw_power,
+        ] {
+            t.reconfigure(RAW_SAMPLES, sample_period);
+        }
     }
 }
 
@@ -326,6 +357,7 @@ fn handle_command(
                     // One bucket per pixel column is plenty; tie it to the
                     // rate so the window covers a sensible span at any rate.
                     s.bucket_seconds = bucket_seconds_for(rate);
+                    s.reconfigure_raw(1.0 / rate.max(1) as f64);
                     s.status = Status::Running;
                     s.push_log(LogLevel::Info, format!("streaming at {rate} Hz"), started);
                     *session = Some(new);
@@ -450,20 +482,26 @@ fn pump(session: &mut Session, shared: &Arc<Mutex<Shared>>, started: Instant) ->
         if n > 0 {
             let first_index = session.next_index;
             let mut guard = shared.lock().expect("shared snapshot poisoned");
+            // Both representations are fed: the coarse trace is the long
+            // history, the raw ring is what makes zooming in show the real
+            // waveform rather than a pre-averaged block.
             if let Some(c) = rows.current {
                 guard
                     .current
                     .extend(c, first_index, session.sample_period, bucket_seconds);
+                guard.raw_current.push(c, first_index);
             }
             if let Some(v) = rows.voltage {
                 guard
                     .voltage
                     .extend(v, first_index, session.sample_period, bucket_seconds);
+                guard.raw_voltage.push(v, first_index);
             }
             if let Some(p) = rows.power {
                 guard
                     .power
                     .extend(p, first_index, session.sample_period, bucket_seconds);
+                guard.raw_power.push(p, first_index);
             }
             guard.current.finish(bucket_seconds);
             guard.voltage.finish(bucket_seconds);

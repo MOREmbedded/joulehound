@@ -30,17 +30,29 @@ impl Bucket {
     }
 }
 
-/// Aggregate of every bucket between two markers.
+/// Aggregate of a span of samples, matching the fields the instrument's own
+/// software reports beside a marker.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RangeStats {
+    /// Arithmetic mean over the span.
+    pub mean: f32,
+    /// Population standard deviation over the span.
+    pub std: f32,
+    /// Root mean square over the span.
+    pub rms: f32,
     /// Smallest sample in the span.
     pub min: f32,
     /// Largest sample in the span.
     pub max: f32,
-    /// Mean of the bucket means in the span.
-    pub mean: f32,
-    /// Number of buckets contributing.
+    /// Number of samples, or buckets, contributing.
     pub buckets: usize,
+}
+
+impl RangeStats {
+    /// Peak to peak, the span between the extremes.
+    pub fn p2p(&self) -> f32 {
+        self.max - self.min
+    }
 }
 
 /// A fixed-capacity ring of buckets for one signal.
@@ -200,25 +212,6 @@ impl SignalTrace {
     }
 
     /// Time span covered, in seconds.
-    /// The bucket nearest `t`, if the trace covers it.
-    ///
-    /// Markers land wherever the pointer was, which will rarely be exactly on
-    /// a bucket centre, so the nearest one is what the reader means.
-    pub fn value_at(&self, t: f64) -> Option<Bucket> {
-        let mut best: Option<(f64, Bucket)> = None;
-        for b in self.iter() {
-            if b.is_empty() {
-                continue;
-            }
-            let d = (b.t - t).abs();
-            match best {
-                Some((bd, _)) if bd <= d => {}
-                _ => best = Some((d, b)),
-            }
-        }
-        best.map(|(_, b)| b)
-    }
-
     /// Aggregate every bucket between `t0` and `t1`, in either order.
     ///
     /// This is what a pair of markers measures: the extremes are the true
@@ -226,27 +219,36 @@ impl SignalTrace {
     /// rather than from the means, so a spike inside the span is reported.
     pub fn range_stats(&self, t0: f64, t1: f64) -> Option<RangeStats> {
         let (lo, hi) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
-        let mut stats = RangeStats {
-            min: f32::INFINITY,
-            max: f32::NEG_INFINITY,
-            mean: 0.0,
-            buckets: 0,
-        };
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
         let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut n = 0usize;
         for b in self.iter() {
             if b.is_empty() || b.t < lo || b.t > hi {
                 continue;
             }
-            stats.min = stats.min.min(b.min);
-            stats.max = stats.max.max(b.max);
+            min = min.min(b.min);
+            max = max.max(b.max);
             sum += b.mean as f64;
-            stats.buckets += 1;
+            sum_sq += (b.mean as f64) * (b.mean as f64);
+            n += 1;
         }
-        if stats.buckets == 0 {
+        if n == 0 {
             return None;
         }
-        stats.mean = (sum / stats.buckets as f64) as f32;
-        Some(stats)
+        // Taken over the bucket means, since the individual samples are gone;
+        // the raw trace reports these over the samples themselves.
+        let mean = sum / n as f64;
+        let var = (sum_sq / n as f64 - mean * mean).max(0.0);
+        Some(RangeStats {
+            mean: mean as f32,
+            std: var.sqrt() as f32,
+            rms: (sum_sq / n as f64).sqrt() as f32,
+            min,
+            max,
+            buckets: n,
+        })
     }
 
     /// Time span covered, in seconds.
@@ -388,24 +390,6 @@ mod tests {
         let (first, last) = t.time_span().unwrap();
         assert!(first < last);
         assert!((last - first - 2.0 * BUCKET).abs() < 1e-9);
-    }
-
-    #[test]
-    fn value_at_finds_the_nearest_bucket() {
-        let mut t = SignalTrace::new(10);
-        for i in 0..5u64 {
-            t.extend(&[i as f32; 1000], i * 1000, PERIOD, BUCKET);
-        }
-        t.finish(BUCKET);
-        // Bucket centres are at 0.5, 1.5, 2.5, 3.5, 4.5 ms.
-        assert_eq!(t.value_at(0.0).unwrap().mean, 0.0);
-        assert_eq!(t.value_at(0.0026).unwrap().mean, 2.0);
-        assert_eq!(t.value_at(99.0).unwrap().mean, 4.0, "clamps to the last");
-    }
-
-    #[test]
-    fn value_at_on_an_empty_trace_is_none() {
-        assert!(SignalTrace::new(4).value_at(0.0).is_none());
     }
 
     #[test]

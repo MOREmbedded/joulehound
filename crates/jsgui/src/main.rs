@@ -13,6 +13,7 @@
 mod acquire;
 mod app;
 mod buffer;
+mod raw;
 mod fmt;
 
 fn main() -> eframe::Result<()> {
