@@ -146,8 +146,11 @@ pub struct App {
     view_x: Option<(f64, f64)>,
     marker_a: Option<f64>,
     marker_b: Option<f64>,
-    /// Which marker a drag is currently moving.
-    dragging: Option<Marker>,
+    /// What the current drag is moving, if anything.
+    dragging: Option<Grab>,
+    /// Plot x at the previous drag frame, so movement is applied
+    /// incrementally and survives a zoom mid-drag.
+    drag_last_x: f64,
     /// Scratch for aggregated buckets, reused every frame.
     buckets: Vec<Bucket>,
 }
@@ -157,6 +160,15 @@ pub struct App {
 enum Marker {
     A,
     B,
+}
+
+/// What a press on a plot took hold of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grab {
+    /// One marker, moved on its own.
+    Marker(Marker),
+    /// The span between the markers, moved rigidly.
+    Span,
 }
 
 impl App {
@@ -182,6 +194,7 @@ impl App {
             marker_a: None,
             marker_b: None,
             dragging: None,
+            drag_last_x: 0.0,
             buckets: Vec::new(),
         };
         app.rescan();
@@ -582,11 +595,27 @@ impl App {
                     self.auto_y[i] = false;
                     self.view_y[i] = Some(y);
                 }
-                if let Some((marker, t)) = outcome.drag {
-                    self.dragging = Some(marker);
-                    match marker {
-                        Marker::A => self.marker_a = Some(t),
-                        Marker::B => self.marker_b = Some(t),
+                if let Some((grab, t)) = outcome.press {
+                    self.dragging = grab;
+                    self.drag_last_x = t;
+                }
+                if let (Some(grab), Some(t)) = (self.dragging, outcome.drag_x) {
+                    // Applied as a delta rather than by snapping the marker to
+                    // the pointer, so grabbing a line off-centre does not jump
+                    // it, and a zoom mid-drag stays consistent.
+                    let dx = t - self.drag_last_x;
+                    self.drag_last_x = t;
+                    match grab {
+                        Grab::Marker(Marker::A) => {
+                            self.marker_a = self.marker_a.map(|v| v + dx);
+                        }
+                        Grab::Marker(Marker::B) => {
+                            self.marker_b = self.marker_b.map(|v| v + dx);
+                        }
+                        Grab::Span => {
+                            self.marker_a = self.marker_a.map(|v| v + dx);
+                            self.marker_b = self.marker_b.map(|v| v + dx);
+                        }
                     }
                 }
             }
@@ -699,12 +728,14 @@ struct PlotOutcome {
     new_x: Option<(f64, f64)>,
     /// A Y range the user panned or zoomed to.
     new_y: Option<(f64, f64)>,
-    /// A marker the user is positioning.
-    drag: Option<(Marker, f64)>,
+    /// A press happened here: what it took hold of, and where in time.
+    press: Option<(Option<Grab>, f64)>,
+    /// Where the pointer is, while something is held.
+    drag_x: Option<f64>,
 }
 
 /// How close, in screen points, the pointer must be to grab a marker.
-const GRAB_RADIUS: f32 = 10.0;
+const GRAB_RADIUS: f32 = 14.0;
 
 #[allow(clippy::too_many_arguments)]
 fn plot_signal(
@@ -717,7 +748,7 @@ fn plot_signal(
     x: (f64, f64),
     y: (f64, f64),
     markers: (Option<f64>, Option<f64>),
-    dragging: Option<Marker>,
+    dragging: Option<Grab>,
 ) -> PlotOutcome {
     let unit = view.unit;
     let plot = Plot::new(view.name)
@@ -833,43 +864,52 @@ fn plot_signal(
     interact(ui, &response, x, y, markers, dragging)
 }
 
-/// Apply the pan and zoom gestures to the ranges this code owns.
+/// Apply the pan, zoom and marker gestures to the ranges this code owns.
 ///
 /// Zooming scales about the pointer so whatever is under the cursor stays
-/// put, which is what makes zooming feel aimed rather than arbitrary. Holding
-/// shift restricts a wheel zoom to time, ctrl to the value axis; unmodified it
-/// zooms both.
+/// put. Holding shift restricts a wheel zoom to time, ctrl to the value axis;
+/// unmodified it zooms both.
 fn interact(
     ui: &egui::Ui,
     response: &egui_plot::PlotResponse<()>,
     x: (f64, f64),
     y: (f64, f64),
     markers: (Option<f64>, Option<f64>),
-    dragging: Option<Marker>,
+    dragging: Option<Grab>,
 ) -> PlotOutcome {
     let r = &response.response;
     let mut out = PlotOutcome {
         new_x: None,
         new_y: None,
-        drag: None,
+        press: None,
+        drag_x: None,
     };
+
+    let plot_x = |pos: egui::Pos2| response.transform.value_from_position(pos).x;
+
+    // What a press takes hold of is decided at the moment the button goes
+    // down, not once the drag is under way. egui only reports a drag after
+    // the pointer has moved past its threshold, by which point the cursor has
+    // already left a marker it was aimed at, and the grab would miss.
+    if r.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            out.press = Some((grab_at(&response.transform, markers, pos), plot_x(pos)));
+        }
+    }
 
     // The press must have begun on this plot, so the synthetic pointer events
     // a window move or resize produces cannot be mistaken for a gesture.
     let gesture = r.dragged() && r.is_pointer_button_down_on();
 
-    // A marker under the pointer takes the drag; the view stays put.
     if gesture {
         if let Some(pos) = r.interact_pointer_pos() {
-            let held = dragging.or_else(|| nearest_marker(&response.transform, markers, pos));
-            if let Some(m) = held {
-                out.drag = Some((m, response.transform.value_from_position(pos).x));
+            // Something is held: report where the pointer is and let the
+            // caller move it. The view stays put.
+            if dragging.is_some() {
+                out.drag_x = Some(plot_x(pos));
                 return out;
             }
         }
-    }
-
-    if gesture {
         let d = r.drag_delta();
         if d.length() > 0.0 {
             let per_px = response.transform.dvalue_dpos();
@@ -878,6 +918,15 @@ fn interact(
             out.new_x = Some((x.0 - dx, x.1 - dx));
             out.new_y = Some((y.0 - dy, y.1 - dy));
             return out;
+        }
+    }
+
+    // Tell the user what is grabbable before they press.
+    if dragging.is_none() {
+        if let Some(pos) = r.hover_pos() {
+            if grab_at(&response.transform, markers, pos).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
         }
     }
 
@@ -903,6 +952,38 @@ fn interact(
     out
 }
 
+/// What lies under `pos`: a marker, the span between them, or nothing.
+///
+/// A marker wins over the span, so the edges of a selection stay adjustable
+/// rather than being swallowed by the region they bound.
+fn grab_at(
+    transform: &egui_plot::PlotTransform,
+    markers: (Option<f64>, Option<f64>),
+    pos: egui::Pos2,
+) -> Option<Grab> {
+    let screen_x = |t: f64| transform.position_from_point(&PlotPoint::new(t, 0.0)).x;
+
+    let mut best: Option<(f32, Marker)> = None;
+    for (t, which) in [(markers.0, Marker::A), (markers.1, Marker::B)] {
+        let Some(t) = t else { continue };
+        let d = (screen_x(t) - pos.x).abs();
+        if d <= GRAB_RADIUS && best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, which));
+        }
+    }
+    if let Some((_, m)) = best {
+        return Some(Grab::Marker(m));
+    }
+
+    if let (Some(a), Some(b)) = markers {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        if pos.x > screen_x(lo) && pos.x < screen_x(hi) {
+            return Some(Grab::Span);
+        }
+    }
+    None
+}
+
 /// Scale `range` by `factor` while keeping `anchor` at the same position.
 fn zoom_about(range: (f64, f64), anchor: f64, factor: f64) -> (f64, f64) {
     let width = range.1 - range.0;
@@ -917,32 +998,14 @@ fn zoom_about(range: (f64, f64), anchor: f64, factor: f64) -> (f64, f64) {
     (lo, lo + new_width)
 }
 
-/// The marker within grabbing distance of `pos`, if any.
-fn nearest_marker(
-    transform: &egui_plot::PlotTransform,
-    markers: (Option<f64>, Option<f64>),
-    pos: egui::Pos2,
-) -> Option<Marker> {
-    let mut best: Option<(f32, Marker)> = None;
-    for (t, which) in [(markers.0, Marker::A), (markers.1, Marker::B)] {
-        let Some(t) = t else { continue };
-        let screen_x = transform.position_from_point(&PlotPoint::new(t, 0.0)).x;
-        let d = (screen_x - pos.x).abs();
-        if d <= GRAB_RADIUS && best.map_or(true, |(bd, _)| d < bd) {
-            best = Some((d, which));
-        }
-    }
-    best.map(|(_, m)| m)
-}
-
 /// Trace the min/max band as one continuous polyline.
 ///
 /// Filling it as a polygon looks obvious but renders wrongly: egui fills only
 /// convex shapes, and an envelope is deeply non-convex, so the fill comes out
-/// as a fan of diagonals across the plot. Walking each column's min and max
-/// alternately draws the same band as vertical strokes, which is how a scope
-/// renders min/max anyway, and costs one polyline instead of thousands of
-/// quads.
+/// as a fan of diagonals across the plot. Walking each column from its minimum
+/// to its maximum draws the same band as vertical strokes, which is how a
+/// scope renders min/max anyway, and costs one polyline instead of thousands
+/// of quads.
 fn envelope_zigzag(upper: &[[f64; 2]], lower: &[[f64; 2]]) -> Vec<[f64; 2]> {
     let mut out = Vec::with_capacity(upper.len() * 2);
     for (i, (hi, lo)) in upper.iter().zip(lower).enumerate() {
@@ -1092,6 +1155,81 @@ mod tests {
     #[test]
     fn the_envelope_of_nothing_is_empty() {
         assert!(envelope_zigzag(&[], &[]).is_empty());
+    }
+
+    /// A transform mapping plot x 0..100 onto screen x 0..1000.
+    fn transform() -> egui_plot::PlotTransform {
+        egui_plot::PlotTransform::new(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 100.0)),
+            PlotBounds::from_min_max([0.0, 0.0], [100.0, 10.0]),
+            false,
+        )
+    }
+
+    fn at(x: f32) -> egui::Pos2 {
+        egui::pos2(x, 50.0)
+    }
+
+    #[test]
+    fn a_press_on_a_marker_grabs_it() {
+        let t = transform();
+        // Markers at plot 20 and 60 are screen 200 and 600.
+        let m = (Some(20.0), Some(60.0));
+        assert_eq!(grab_at(&t, m, at(200.0)), Some(Grab::Marker(Marker::A)));
+        assert_eq!(grab_at(&t, m, at(600.0)), Some(Grab::Marker(Marker::B)));
+    }
+
+    #[test]
+    fn a_marker_can_be_grabbed_slightly_off_centre() {
+        // Hitting a one-pixel line exactly is not reasonable to ask.
+        let t = transform();
+        let m = (Some(20.0), None);
+        assert_eq!(
+            grab_at(&t, m, at(200.0 + GRAB_RADIUS - 1.0)),
+            Some(Grab::Marker(Marker::A))
+        );
+        assert_eq!(
+            grab_at(&t, m, at(200.0 - GRAB_RADIUS + 1.0)),
+            Some(Grab::Marker(Marker::A))
+        );
+    }
+
+    #[test]
+    fn a_press_well_away_from_a_marker_grabs_nothing() {
+        let t = transform();
+        let m = (Some(20.0), None);
+        assert_eq!(grab_at(&t, m, at(200.0 + GRAB_RADIUS * 3.0)), None);
+    }
+
+    #[test]
+    fn a_press_between_the_markers_grabs_the_span() {
+        let t = transform();
+        let m = (Some(20.0), Some(60.0));
+        assert_eq!(grab_at(&t, m, at(400.0)), Some(Grab::Span));
+    }
+
+    #[test]
+    fn a_marker_wins_over_the_span_it_bounds() {
+        // Otherwise the edges of a selection could never be adjusted.
+        let t = transform();
+        let m = (Some(20.0), Some(60.0));
+        assert_eq!(
+            grab_at(&t, m, at(200.0 + 2.0)),
+            Some(Grab::Marker(Marker::A))
+        );
+    }
+
+    #[test]
+    fn the_span_needs_both_markers() {
+        let t = transform();
+        assert_eq!(grab_at(&t, (Some(20.0), None), at(400.0)), None);
+        assert_eq!(grab_at(&t, (None, None), at(400.0)), None);
+    }
+
+    #[test]
+    fn the_span_is_found_whichever_order_the_markers_are_in() {
+        let t = transform();
+        assert_eq!(grab_at(&t, (Some(60.0), Some(20.0)), at(400.0)), Some(Grab::Span));
     }
 
     #[test]
