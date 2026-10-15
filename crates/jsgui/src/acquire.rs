@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use js220::proto::stats::Statistics;
+use js220::device::Source;
 use js220::{Js220, Signal, StreamConfig, TransportConfig};
 
 use crate::buffer::SignalTrace;
@@ -49,7 +50,9 @@ pub enum Command {
     Start {
         /// Serial number, or `None` for the first device found.
         serial: Option<String>,
-        /// Requested output sample rate in Hz.
+        /// Which acquisition path to stream.
+        source: Source,
+        /// Requested output sample rate in Hz, for the calibrated path.
         rate: u32,
         /// Enable the on-instrument statistics stream.
         statistics: bool,
@@ -139,6 +142,9 @@ pub struct Shared {
     pub log: Vec<LogLine>,
     /// Seconds covered by one display bucket.
     pub bucket_seconds: f64,
+    /// The acquisition path currently streaming, which decides whether the
+    /// samples are physical units or raw counts.
+    pub source: Source,
 }
 
 /// One line in the GUI log pane.
@@ -188,6 +194,7 @@ impl Shared {
             recording: None,
             log: Vec::new(),
             bucket_seconds: 0.001,
+            source: Source::Calibrated,
         }
     }
 
@@ -339,6 +346,7 @@ fn handle_command(
     match cmd {
         Command::Start {
             serial,
+            source,
             rate,
             statistics,
         } => {
@@ -351,7 +359,7 @@ fn handle_command(
                 s.filled = 0;
                 s.elapsed = 0.0;
             }
-            match start_session(serial.as_deref(), rate, statistics) {
+            match start_session(serial.as_deref(), source, rate, statistics) {
                 Ok(new) => {
                     let mut s = shared.lock().expect("shared snapshot poisoned");
                     s.serial = Some(new.device.serial().to_owned());
@@ -362,8 +370,13 @@ fn handle_command(
                     ));
                     // One bucket per pixel column is plenty; tie it to the
                     // rate so the window covers a sensible span at any rate.
-                    s.bucket_seconds = bucket_seconds_for(rate);
-                    s.reconfigure_raw(1.0 / rate.max(1) as f64);
+                    let effective = match source {
+                        Source::RawAdc => js220::BASE_RATE,
+                        Source::Calibrated => rate,
+                    };
+                    s.source = source;
+                    s.bucket_seconds = bucket_seconds_for(effective);
+                    s.reconfigure_raw(1.0 / effective.max(1) as f64);
                     s.status = Status::Running;
                     s.push_log(LogLevel::Info, format!("streaming at {rate} Hz"), started);
                     *session = Some(new);
@@ -451,12 +464,23 @@ fn bucket_seconds_for(rate: u32) -> f64 {
     HISTORY_BUCKET_SECONDS.max(sample_period)
 }
 
-fn start_session(serial: Option<&str>, rate: u32, statistics: bool) -> js220::Result<Session> {
+fn start_session(
+    serial: Option<&str>,
+    source: Source,
+    rate: u32,
+    statistics: bool,
+) -> js220::Result<Session> {
     let device = Js220::open_with(serial, TransportConfig::default())?;
+    // Raw ADC runs at its own fixed rate; the selector only governs the
+    // calibrated path.
+    let effective = match source {
+        Source::RawAdc => js220::BASE_RATE,
+        Source::Calibrated => rate,
+    };
     let mut session = Session {
         device,
-        rate,
-        sample_period: 1.0 / rate as f64,
+        rate: effective,
+        sample_period: 1.0 / effective as f64,
         next_index: 0,
         started: Instant::now(),
         last_stats: Instant::now(),
@@ -465,6 +489,7 @@ fn start_session(serial: Option<&str>, rate: u32, statistics: bool) -> js220::Re
         recorder: None,
     };
     let cfg = StreamConfig {
+        source,
         signals: vec![Signal::Current, Signal::Voltage, Signal::Power],
         sample_rate: rate,
         statistics,

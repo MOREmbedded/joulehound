@@ -93,7 +93,15 @@ impl DeviceArgs {
 
 #[derive(Args, Clone)]
 struct StreamArgs {
-    /// Output sample rate in Hz. Must divide 2000000 exactly.
+    /// Which acquisition path to stream.
+    ///
+    /// Raw delivers ADC counts at 2 MHz with no gain, offset or range
+    /// correction applied. Twice the rate, but not a measurement.
+    #[arg(long, value_enum, default_value_t = SourceArg::Calibrated)]
+    source: SourceArg,
+
+    /// Output sample rate in Hz. Must divide 2000000 exactly. Ignored for
+    /// --source raw, which always runs at 2000000.
     #[arg(short, long, default_value_t = 1_000_000, value_name = "HZ")]
     rate: u32,
 
@@ -108,6 +116,15 @@ struct StreamArgs {
     /// Hold a fixed voltage range instead of auto-ranging.
     #[arg(long, value_name = "RANGE")]
     voltage_range: Option<VoltageRangeArg>,
+}
+
+/// Which acquisition path to stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SourceArg {
+    /// Calibrated amperes and volts, up to 1 MHz.
+    Calibrated,
+    /// Uncalibrated ADC counts at the full 2 MHz.
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -140,8 +157,21 @@ impl StreamArgs {
         Ok(out)
     }
 
+    /// The rate samples will actually arrive at.
+    fn effective_rate(&self) -> u32 {
+        match self.source {
+            SourceArg::Raw => js220::BASE_RATE,
+            SourceArg::Calibrated => self.rate,
+        }
+    }
+
     fn config(&self, statistics: bool, statistics_rate: f64) -> Result<StreamConfig> {
         let cfg = StreamConfig {
+            source: match self.source {
+                SourceArg::Calibrated => js220::device::Source::Calibrated,
+                SourceArg::Raw => js220::device::Source::RawAdc,
+            },
+            adc_channels: (0, 1),
             signals: self.signals()?,
             sample_rate: self.rate,
             statistics,
@@ -636,7 +666,9 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     let mut dev = args.device.open()?;
     let cfg = args.stream.config(false, 2.0)?;
     let signals = cfg.signals.clone();
-    let rate = cfg.sample_rate;
+    // Raw ADC ignores the rate selector, so measure against what the source
+    // actually delivers or the percentage would be nonsense.
+    let rate = args.stream.effective_rate();
     let transport = *dev.transport_config();
 
     eprintln!(
@@ -762,6 +794,7 @@ mod tests {
 
     fn stream_args(signals: &str, rate: u32) -> StreamArgs {
         StreamArgs {
+            source: SourceArg::Calibrated,
             rate,
             signals: signals.into(),
             current_range: None,

@@ -8,6 +8,7 @@ use egui_plot::{
 };
 
 use crate::acquire::{Acquisition, Command, LogLevel, Shared, Status};
+use js220::device::Source;
 use crate::buffer::{Bucket, RangeStats, SignalTrace};
 use crate::fmt;
 use crate::raw::RawTrace;
@@ -22,6 +23,7 @@ const WINDOWS: [f64; 8] = [0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
 const I: usize = 0;
 
 /// One plotted signal.
+#[derive(Clone)]
 struct SignalView {
     name: &'static str,
     unit: &'static str,
@@ -52,6 +54,41 @@ const VIEWS: [SignalView; 3] = [
     },
 ];
 
+/// Relabel the views for the acquisition path in use.
+///
+/// Raw ADC counts are not amperes or volts and must never be drawn as though
+/// they were, so the names, units and the integral all change with the source.
+fn views_for(source: Source, channels: (u8, u8)) -> Vec<SignalView> {
+    match source {
+        Source::Calibrated => VIEWS.to_vec(),
+        Source::RawAdc => vec![
+            SignalView {
+                name: adc_name(channels.0),
+                unit: "counts",
+                integral_unit: None,
+                colour: VIEWS[0].colour,
+            },
+            SignalView {
+                name: adc_name(channels.1),
+                unit: "counts",
+                integral_unit: None,
+                colour: VIEWS[1].colour,
+            },
+        ],
+    }
+}
+
+/// Name for an ADC channel. The instrument publishes no metadata saying what
+/// each one measures, so they are identified by number and nothing more.
+fn adc_name(channel: u8) -> &'static str {
+    match channel {
+        0 => "ADC 0",
+        1 => "ADC 1",
+        2 => "ADC 2",
+        _ => "ADC 3",
+    }
+}
+
 /// Colour of marker A.
 const MARKER_A: egui::Color32 = egui::Color32::from_rgb(255, 235, 120);
 /// Colour of marker B.
@@ -64,6 +101,8 @@ pub struct App {
     devices: Vec<String>,
     rate: u32,
     statistics: bool,
+    /// Which acquisition path to request on the next Start.
+    source: Source,
     record_path: String,
     show_log: bool,
     /// Keep the newest data in view. Shared, because the plots share one
@@ -110,6 +149,7 @@ impl App {
             devices: Vec::new(),
             rate: 1_000_000,
             statistics: true,
+            source: Source::Calibrated,
             record_path: default_record_path(),
             show_log: false,
             follow: [true; VIEWS.len()],
@@ -127,6 +167,7 @@ impl App {
         if autostart && app.serial.is_some() {
             app.acq.send(Command::Start {
                 serial: app.serial.clone(),
+                source: app.source,
                 rate: app.rate,
                 statistics: app.statistics,
             });
@@ -198,14 +239,39 @@ impl App {
                     if ui.button("⟳").on_hover_text("Rescan for devices").clicked() {
                         self.rescan();
                     }
-                    egui::ComboBox::from_id_salt("rate")
-                        .width(84.0)
-                        .selected_text(fmt::rate(self.rate))
+                    egui::ComboBox::from_id_salt("source")
+                        .width(132.0)
+                        .selected_text(match self.source {
+                            Source::Calibrated => "Calibrated",
+                            Source::RawAdc => "Raw ADC",
+                        })
                         .show_ui(ui, |ui| {
-                            for r in RATES {
-                                ui.selectable_value(&mut self.rate, r, fmt::rate(r));
-                            }
+                            ui.selectable_value(
+                                &mut self.source,
+                                Source::Calibrated,
+                                "Calibrated",
+                            )
+                            .on_hover_text("Amperes and volts, up to 1 MHz");
+                            ui.selectable_value(&mut self.source, Source::RawAdc, "Raw ADC")
+                                .on_hover_text(
+                                    "Uncalibrated ADC counts at 2 MHz: twice the rate,                                      no gain, offset or range correction applied",
+                                );
                         });
+                    // The rate selector only governs the calibrated path; raw
+                    // ADC is fixed at the full base rate.
+                    ui.add_enabled_ui(self.source == Source::Calibrated, |ui| {
+                        egui::ComboBox::from_id_salt("rate")
+                            .width(84.0)
+                            .selected_text(match self.source {
+                                Source::Calibrated => fmt::rate(self.rate),
+                                Source::RawAdc => fmt::rate(js220::BASE_RATE),
+                            })
+                            .show_ui(ui, |ui| {
+                                for r in RATES {
+                                    ui.selectable_value(&mut self.rate, r, fmt::rate(r));
+                                }
+                            });
+                    });
                 });
 
                 if running {
@@ -218,6 +284,7 @@ impl App {
                 {
                     self.acq.send(Command::Start {
                         serial: self.serial.clone(),
+                        source: self.source,
                         rate: self.rate,
                         statistics: self.statistics,
                     });
@@ -225,8 +292,12 @@ impl App {
 
                 ui.separator();
                 ui.label("Signals:");
-                for (i, view) in VIEWS.iter().enumerate() {
-                    let label = egui::RichText::new(&view.unit[..1]).color(view.colour).strong();
+                for (i, view) in views_for(self.source, (0, 1)).iter().enumerate() {
+                    let short = match self.source {
+                        Source::Calibrated => view.unit[..1].to_string(),
+                        Source::RawAdc => i.to_string(),
+                    };
+                    let label = egui::RichText::new(short).color(view.colour).strong();
                     ui.toggle_value(&mut self.visible[i], label)
                         .on_hover_text(view.name);
                 }
@@ -423,7 +494,8 @@ impl App {
 
     fn plots(&mut self, ctx: &egui::Context, shared: &Shared) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let shown: Vec<usize> = (0..VIEWS.len()).filter(|i| self.visible[*i]).collect();
+            let views = views_for(shared.source, (0, 1));
+            let shown: Vec<usize> = (0..views.len()).filter(|i| self.visible[*i]).collect();
             if shown.is_empty() {
                 ui.centered_and_justified(|ui| ui.weak("No signals selected"));
                 return;

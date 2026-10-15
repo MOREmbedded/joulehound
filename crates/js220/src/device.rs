@@ -23,10 +23,6 @@ pub const MAX_SAMPLE_RATE: u32 = 1_000_000;
 /// Lowest rate the instrument can decimate to on its own.
 pub const MIN_SAMPLE_RATE: u32 = 1_000;
 
-/// Sample id step between consecutive samples as the instrument sends them,
-/// which is fixed at its 1 Msps analog output rate.
-const DEVICE_SAMPLE_STEP: u32 = BASE_RATE / MAX_SAMPLE_RATE;
-
 /// How long to wait for a port 0 echo to come back.
 const ECHO_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -82,6 +78,49 @@ fn session_ping_seed() -> u8 {
     (nanos % 251) as u8 + 1
 }
 
+/// Which acquisition path to stream.
+///
+/// The instrument has two, and they trade accuracy against rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    /// Calibrated current and voltage, up to [`MAX_SAMPLE_RATE`].
+    ///
+    /// This is the measurement path: gain, offset and range correction are
+    /// applied on the instrument and the samples arrive in amperes and volts.
+    #[default]
+    Calibrated,
+    /// Raw ADC counts at the full [`BASE_RATE`], twice the calibrated rate.
+    ///
+    /// Nothing is applied to these samples: no gain, no offset, no range
+    /// correction, and no indication of which range was active. They are
+    /// useful for seeing fast edges, not for absolute measurement, and must
+    /// not be presented as amperes or volts.
+    RawAdc,
+}
+
+impl Source {
+    /// The rate this source streams at.
+    pub const fn rate(self) -> u32 {
+        match self {
+            Self::Calibrated => MAX_SAMPLE_RATE,
+            Self::RawAdc => BASE_RATE,
+        }
+    }
+
+    /// Sample id step between consecutive samples from this source.
+    pub const fn sample_step(self) -> u32 {
+        BASE_RATE / self.rate()
+    }
+
+    /// Unit of the samples, for display.
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::Calibrated => "",
+            Self::RawAdc => "counts",
+        }
+    }
+}
+
 /// Current range selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CurrentRange {
@@ -109,15 +148,25 @@ pub enum VoltageRange {
 /// What to stream and how.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
+    /// Which of the instrument's two acquisition paths to stream.
+    pub source: Source,
     /// Signals to deliver. Requesting power implicitly enables current and
     /// voltage, since power is computed on the host.
+    ///
+    /// Ignored for [`Source::RawAdc`], which delivers the ADC channels named
+    /// by [`StreamConfig::adc_channels`] instead.
     pub signals: Vec<Signal>,
+    /// The two ADC channels to stream for [`Source::RawAdc`].
+    ///
+    /// The instrument exposes four and publishes no metadata saying what each
+    /// one measures, so they are identified by number only.
+    pub adc_channels: (u8, u8),
     /// Output sample rate in Hz.
     ///
     /// Must divide 2 MHz exactly and lie between [`MIN_SAMPLE_RATE`] and
-    /// [`MAX_SAMPLE_RATE`]. Rates below the maximum are produced by the
-    /// instrument's own decimation filter, so they cost host CPU and USB
-    /// bandwidth proportionally rather than being filtered after the fact.
+    /// [`MAX_SAMPLE_RATE`]. Rates below the maximum are produced by host-side
+    /// averaging. [`Source::RawAdc`] ignores this and always runs at
+    /// [`BASE_RATE`].
     pub sample_rate: u32,
     /// Enable the on-instrument statistics stream.
     pub statistics: bool,
@@ -132,7 +181,9 @@ pub struct StreamConfig {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
+            source: Source::Calibrated,
             signals: vec![Signal::Current, Signal::Voltage, Signal::Power],
+            adc_channels: (0, 1),
             sample_rate: MAX_SAMPLE_RATE,
             statistics: false,
             statistics_rate: 2.0,
@@ -152,6 +203,22 @@ impl StreamConfig {
             return Err(Error::Config {
                 reason: "no signals selected and statistics are disabled".into(),
             });
+        }
+        if self.source == Source::RawAdc {
+            for ch in [self.adc_channels.0, self.adc_channels.1] {
+                if ch > 3 {
+                    return Err(Error::Config {
+                        reason: format!("ADC channel {ch} does not exist; the instrument has 0..=3"),
+                    });
+                }
+            }
+            if self.adc_channels.0 == self.adc_channels.1 {
+                return Err(Error::Config {
+                    reason: "the two ADC channels must differ".into(),
+                });
+            }
+            // The rate is fixed by the source, so nothing below applies.
+            return Ok(());
         }
         let fs = self.sample_rate;
         if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&fs) {
@@ -179,12 +246,28 @@ impl StreamConfig {
 
     /// Sample id increment between consecutive output samples.
     pub fn decimate(&self) -> u32 {
-        (BASE_RATE / self.sample_rate).max(1)
+        match self.source {
+            Source::RawAdc => 1,
+            Source::Calibrated => (BASE_RATE / self.sample_rate).max(1),
+        }
     }
 
-    /// Number of 1 Msps samples averaged into each output sample.
+    /// The rate samples actually arrive at.
+    pub fn effective_rate(&self) -> u32 {
+        match self.source {
+            Source::RawAdc => BASE_RATE,
+            Source::Calibrated => self.sample_rate,
+        }
+    }
+
+    /// Number of instrument samples averaged into each output sample.
+    ///
+    /// Raw ADC is never averaged: the point of it is the unprocessed samples.
     pub fn host_decimation(&self) -> u32 {
-        (MAX_SAMPLE_RATE / self.sample_rate).max(1)
+        match self.source {
+            Source::RawAdc => 1,
+            Source::Calibrated => (MAX_SAMPLE_RATE / self.sample_rate).max(1),
+        }
     }
 
     /// Signals that must actually be streamed from the device, which is the
@@ -257,6 +340,11 @@ pub struct Js220 {
     power: Vec<f32>,
     /// Reused decode buffer for incoming sample frames.
     scratch: Vec<f32>,
+    /// Reused decode buffer for raw ADC counts.
+    adc_scratch: Vec<i16>,
+    /// ADC channels standing in for the current and voltage slots while
+    /// streaming [`Source::RawAdc`].
+    adc_map: Option<(u8, u8)>,
     config: Option<StreamConfig>,
     params: HashMap<String, Value>,
     statistics: Option<Statistics>,
@@ -314,6 +402,8 @@ impl Js220 {
             group: SignalGroup::new(&[], 2, MAX_SAMPLE_RATE as usize),
             power: Vec::new(),
             scratch: Vec::new(),
+            adc_scratch: Vec::new(),
+            adc_map: None,
             config: None,
             params: HashMap::new(),
             statistics: None,
@@ -579,31 +669,51 @@ impl Js220 {
         // dropout, it is a device that has stopped sending, and synthesizing
         // NaN across it manufactures rows that make a dead stream look like a
         // healthy one.
-        let max_fill = (config.sample_rate as usize / 100).max(16);
-        // The instrument always streams at its 1 Msps ceiling; lower rates are
-        // produced by averaging on the host. Its own decimation needs a filter
-        // mode that is not exposed in the topic metadata, and configuring the
-        // divider alone silently produced no samples at all.
+        let max_fill = (config.effective_rate() as usize / 100).max(16);
+        // Calibrated streaming always runs at the 1 Msps ceiling and lower
+        // rates are averaged on the host; the instrument's own decimation
+        // needs a filter mode absent from its topic metadata, and setting the
+        // divider alone silently produced no samples at all. Raw ADC runs at
+        // the full base rate and is never averaged.
         self.group = SignalGroup::with_decimation(
             &device_signals,
             config.decimate(),
             max_fill,
             config.host_decimation(),
-            DEVICE_SAMPLE_STEP,
+            config.source.sample_step(),
         );
         self.power.clear();
         self.scratch.clear();
         self.expect_frame_id = None;
 
-        for signal in &device_signals {
-            let topic = match signal {
-                Signal::Current => topics::S_CURRENT_CTRL,
-                Signal::Voltage => topics::S_VOLTAGE_CTRL,
-                Signal::Power => continue,
-            };
-            // The instrument declares the ctrl topics as u8; publishing the
-            // type it expects avoids relying on its coercion rules.
-            self.publish(topic, Value::U8(1))?;
+        match config.source {
+            Source::Calibrated => {
+                self.adc_map = None;
+                for signal in &device_signals {
+                    let topic = match signal {
+                        Signal::Current => topics::S_CURRENT_CTRL,
+                        Signal::Voltage => topics::S_VOLTAGE_CTRL,
+                        Signal::Power => continue,
+                    };
+                    // The instrument declares the ctrl topics as u8;
+                    // publishing the type it expects avoids relying on its
+                    // coercion rules.
+                    self.publish(topic, Value::U8(1))?;
+                }
+            }
+            Source::RawAdc => {
+                // The two chosen ADC channels are carried in the current and
+                // voltage slots so they get the same alignment and gap
+                // handling; `adc_map` records which is which.
+                let (a, b) = config.adc_channels;
+                self.adc_map = Some((a, b));
+                for ch in [a, b] {
+                    let topic = topics::adc_ctrl(ch).ok_or_else(|| Error::Config {
+                        reason: format!("ADC channel {ch} does not exist"),
+                    })?;
+                    self.publish(topic, Value::U8(1))?;
+                }
+            }
         }
 
         if config.statistics {
@@ -646,6 +756,16 @@ impl Js220 {
                 first_err.get_or_insert(e);
             }
         }
+        // Raw mode leaves ADC ports enabled, which would keep the instrument
+        // streaming into a queue nobody drains.
+        for ch in 0..4u8 {
+            if let Some(topic) = topics::adc_ctrl(ch) {
+                if let Err(e) = self.publish(topic, Value::U8(0)) {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        self.adc_map = None;
         self.group.reset();
         self.power.clear();
         match first_err {
@@ -796,13 +916,26 @@ impl Js220 {
             return;
         }
 
-        let signal = match index {
-            pstream::IDX_CURRENT => Signal::Current,
-            pstream::IDX_VOLTAGE => Signal::Voltage,
-            pstream::IDX_POWER => Signal::Power,
-            _ => {
+        // In raw mode the ADC ports stand in for current and voltage, and
+        // carry i16 counts rather than f32 units.
+        let (signal, raw_adc) = match self.adc_map {
+            Some((a, _)) if index == a => (Signal::Current, true),
+            Some((_, b)) if index == b => (Signal::Voltage, true),
+            Some(_) => {
                 self.counters.ignored_frames += 1;
                 return;
+            }
+            None => {
+                let s = match index {
+                    pstream::IDX_CURRENT => Signal::Current,
+                    pstream::IDX_VOLTAGE => Signal::Voltage,
+                    pstream::IDX_POWER => Signal::Power,
+                    _ => {
+                        self.counters.ignored_frames += 1;
+                        return;
+                    }
+                };
+                (s, false)
             }
         };
 
@@ -817,7 +950,17 @@ impl Js220 {
         // while the samples are borrowed.
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        pstream::decode_f32(data, &mut scratch);
+        if raw_adc {
+            // Widened to f32 so everything downstream is one representation.
+            // These are ADC counts, not amperes or volts.
+            let mut counts = std::mem::take(&mut self.adc_scratch);
+            counts.clear();
+            pstream::decode_i16(data, &mut counts);
+            scratch.extend(counts.iter().map(|v| *v as f32));
+            self.adc_scratch = counts;
+        } else {
+            pstream::decode_f32(data, &mut scratch);
+        }
         self.group.push(signal, raw_id, &scratch);
         self.scratch = scratch;
     }
@@ -834,6 +977,9 @@ impl Js220 {
         // Resolve the requested columns up front so the borrows below stay
         // confined to individual fields.
         let (want_i, want_v, want_p) = match self.config.as_ref() {
+            // Raw ADC fills both slots and has no power to compute: the
+            // counts carry no units to multiply.
+            Some(c) if c.source == Source::RawAdc => (true, true, false),
             Some(c) => (
                 c.signals.contains(&Signal::Current),
                 c.signals.contains(&Signal::Voltage),
@@ -978,6 +1124,75 @@ mod tests {
     fn device_signals_never_include_power() {
         let c = StreamConfig::default();
         assert!(!c.device_signals().contains(&Signal::Power));
+    }
+
+    fn raw() -> StreamConfig {
+        StreamConfig {
+            source: Source::RawAdc,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn raw_adc_runs_at_twice_the_calibrated_rate() {
+        assert_eq!(Source::Calibrated.rate(), MAX_SAMPLE_RATE);
+        assert_eq!(Source::RawAdc.rate(), BASE_RATE);
+        assert_eq!(Source::RawAdc.rate(), 2 * Source::Calibrated.rate());
+    }
+
+    #[test]
+    fn raw_adc_takes_every_sample_the_counter_ticks() {
+        assert_eq!(Source::RawAdc.sample_step(), 1);
+        assert_eq!(Source::Calibrated.sample_step(), 2);
+    }
+
+    #[test]
+    fn raw_adc_ignores_the_rate_selector() {
+        let c = StreamConfig {
+            sample_rate: 1_000,
+            ..raw()
+        };
+        // The requested rate is meaningless for this path.
+        assert_eq!(c.effective_rate(), BASE_RATE);
+        assert_eq!(c.decimate(), 1);
+        assert_eq!(c.host_decimation(), 1, "raw samples are never averaged");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn raw_adc_rejects_channels_that_do_not_exist() {
+        let c = StreamConfig {
+            adc_channels: (0, 4),
+            ..raw()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn raw_adc_rejects_the_same_channel_twice() {
+        let c = StreamConfig {
+            adc_channels: (2, 2),
+            ..raw()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn raw_adc_accepts_any_distinct_pair() {
+        for pair in [(0, 1), (1, 0), (2, 3), (0, 3)] {
+            let c = StreamConfig {
+                adc_channels: pair,
+                ..raw()
+            };
+            c.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn raw_counts_carry_no_physical_unit() {
+        // Labelling these as amperes or volts would be a lie.
+        assert_eq!(Source::RawAdc.unit(), "counts");
+        assert_eq!(Source::Calibrated.unit(), "");
     }
 
     #[test]
