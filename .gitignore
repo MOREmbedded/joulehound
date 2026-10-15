@@ -9,3 +9,6 @@
 # screenshots captured during development
 /shot*.png
 /toolbar.png
+/now.png
+/gui.log
+/gui.out

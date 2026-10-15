@@ -223,6 +223,7 @@ impl App {
 
                 ui.separator();
                 ui.label("X:");
+                let before = self.window_seconds;
                 egui::ComboBox::from_id_salt("window")
                     .width(76.0)
                     .selected_text(fmt::seconds(self.window_seconds))
@@ -231,6 +232,12 @@ impl App {
                             ui.selectable_value(&mut self.window_seconds, w, fmt::seconds(w));
                         }
                     });
+                if self.window_seconds != before {
+                    // Picking a span is a request to see that span of live
+                    // data, not to keep staring at a frozen range of some
+                    // other width.
+                    self.follow = [true; VIEWS.len()];
+                }
                 if ui.button("🔍−").on_hover_text("Show more time").clicked() {
                     self.window_seconds = (self.window_seconds * 2.0).min(60.0);
                     self.follow = [true; VIEWS.len()];
@@ -440,6 +447,7 @@ impl App {
                 );
 
                 if outcome.interacted {
+                    log::debug!("follow cleared by {} on {}", outcome.reason, view.name);
                     self.follow = [false; VIEWS.len()];
                 }
                 if let Some(bounds) = outcome.bounds {
@@ -541,6 +549,8 @@ fn span_stats(raw: &RawTrace, coarse: &SignalTrace, a: f64, b: f64) -> Option<Ra
 /// What the user did to a plot this frame.
 struct PlotOutcome {
     interacted: bool,
+    /// Why `interacted` was set, for diagnosing spurious takeovers.
+    reason: &'static str,
     bounds: Option<(f64, f64)>,
     drag: Option<(Marker, f64)>,
 }
@@ -695,17 +705,25 @@ fn plot_signal(
         }
     }
 
-    // Taking over the view needs a deliberate gesture. A bare `dragged()` also
-    // fires for synthetic pointer events during a window move or resize, which
-    // silently stranded the plot on a range the data had long since left.
-    const DRAG_SLOP: f32 = 2.0;
-    let panned =
-        r.dragged() && drag.is_none() && r.drag_delta().length() > DRAG_SLOP && r.hovered();
+    // Taking over the view needs a press that began on this plot and then
+    // moved. `dragged()` alone also fires for the synthetic pointer events a
+    // window move or resize produces, which silently stranded the plot on a
+    // range the data had long since left.
+    let held = r.is_pointer_button_down_on();
+    let panned = held && r.dragged() && drag.is_none() && r.drag_delta().length() > 0.0;
     let scrolled = r.hovered() && ui.input(|i| i.raw_scroll_delta.y.abs() > 0.0);
     let bounds = response.transform.bounds();
 
+    let reason = if panned {
+        "drag"
+    } else if scrolled {
+        "scroll"
+    } else {
+        ""
+    };
     PlotOutcome {
         interacted: panned || scrolled,
+        reason,
         bounds: Some((bounds.min()[0], bounds.max()[0])),
         drag,
     }
