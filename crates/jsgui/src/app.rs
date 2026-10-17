@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_plot::{
-    AxisHints, Legend, Line, Plot, PlotBounds, PlotPoint, PlotPoints, Polygon, Text, VLine,
+    AxisHints, HLine, Legend, Line, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Points,
+    Polygon, Text, VLine,
 };
 
 use crate::acquire::{Acquisition, Command, LogLevel, Shared, Status};
 use crate::buffer::{Bucket, RangeStats, SignalTrace};
 use crate::fmt;
+use crate::peaks::{self, Edge};
 use crate::raw::RawTrace;
 use js220::device::Source;
 
@@ -113,6 +115,11 @@ fn adc_name(channel: u8) -> &'static str {
     }
 }
 
+/// Colour of peak markers.
+const PEAK: egui::Color32 = egui::Color32::from_rgb(255, 120, 120);
+/// Colour of the threshold level and its regions.
+const THRESHOLD: egui::Color32 = egui::Color32::from_rgb(255, 200, 80);
+
 /// Colour of marker A.
 const MARKER_A: egui::Color32 = egui::Color32::from_rgb(255, 235, 120);
 /// Colour of marker B.
@@ -153,6 +160,15 @@ pub struct App {
     drag_last_x: f64,
     /// Scratch for aggregated buckets, reused every frame.
     buckets: Vec<Bucket>,
+    /// Mark the tallest peaks on every plot.
+    show_peaks: bool,
+    /// How many peaks to mark.
+    peak_count: usize,
+    /// Per-plot threshold level, and whether it is active.
+    threshold: [f64; VIEWS.len()],
+    threshold_on: [bool; VIEWS.len()],
+    /// Which side of the threshold counts.
+    threshold_edge: Edge,
 }
 
 /// Identifies one of the two markers.
@@ -196,6 +212,11 @@ impl App {
             dragging: None,
             drag_last_x: 0.0,
             buckets: Vec::new(),
+            show_peaks: false,
+            peak_count: 5,
+            threshold: [0.0; VIEWS.len()],
+            threshold_on: [false; VIEWS.len()],
+            threshold_edge: Edge::Above,
         };
         app.rescan();
         if autostart && app.serial.is_some() {
@@ -369,6 +390,28 @@ impl App {
                 {
                     self.follow = [true; VIEWS.len()];
                 }
+
+                ui.separator();
+                ui.toggle_value(&mut self.show_peaks, "Peaks")
+                    .on_hover_text("Mark the tallest peaks on every plot");
+                if self.show_peaks {
+                    ui.add(
+                        egui::DragValue::new(&mut self.peak_count)
+                            .range(1..=50)
+                            .speed(0.2)
+                            .prefix("top "),
+                    );
+                }
+                egui::ComboBox::from_id_salt("edge")
+                    .width(72.0)
+                    .selected_text(match self.threshold_edge {
+                        Edge::Above => "above",
+                        Edge::Below => "below",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.threshold_edge, Edge::Above, "above");
+                        ui.selectable_value(&mut self.threshold_edge, Edge::Below, "below");
+                    });
 
                 ui.separator();
                 ui.label("Markers:");
@@ -568,6 +611,15 @@ impl App {
                         }
                         ui.toggle_value(&mut self.auto_y[i], "Auto Y")
                             .on_hover_text("Scale Y to the data in view");
+                        // Entered in the plot unit, so a current limit is
+                        // typed in amperes and a power limit in watts.
+                        ui.add(
+                            egui::DragValue::new(&mut self.threshold[i])
+                                .speed(0.001)
+                                .suffix(format!(" {}", view.unit)),
+                        );
+                        ui.toggle_value(&mut self.threshold_on[i], "Thresh")
+                            .on_hover_text("Mark where the trace crosses the level");
                         ui.toggle_value(&mut self.follow[i], "Follow")
                             .on_hover_text("Keep the newest data in view");
                         // Say where the plotted points came from, so a coarse
@@ -590,6 +642,11 @@ impl App {
                     y
                 };
 
+                let analysis = Analysis {
+                    peaks: self.show_peaks.then_some(self.peak_count),
+                    threshold: self.threshold_on[i].then_some(self.threshold[i] as f32),
+                    edge: self.threshold_edge,
+                };
                 let outcome = plot_signal(
                     ui,
                     view,
@@ -601,6 +658,7 @@ impl App {
                     y_range,
                     (self.marker_a, self.marker_b),
                     self.dragging,
+                    analysis,
                 );
 
                 if let Some(x) = outcome.new_x {
@@ -746,6 +804,17 @@ fn span_stats(raw: &RawTrace, coarse: &SignalTrace, a: f64, b: f64) -> Option<Ra
     raw.range_stats(a, b).or_else(|| coarse.range_stats(a, b))
 }
 
+/// Detection settings applied to a plot.
+#[derive(Debug, Clone, Copy)]
+struct Analysis {
+    /// Mark this many of the tallest peaks.
+    peaks: Option<usize>,
+    /// Mark where the trace crosses this level.
+    threshold: Option<f32>,
+    /// Which side of the level counts.
+    edge: Edge,
+}
+
 /// What the user did to a plot this frame.
 struct PlotOutcome {
     /// A time range the user panned or zoomed to.
@@ -773,6 +842,7 @@ fn plot_signal(
     y: (f64, f64),
     markers: (Option<f64>, Option<f64>),
     dragging: Option<Grab>,
+    analysis: Analysis,
 ) -> PlotOutcome {
     let unit = view.unit;
     let plot = Plot::new(view.name)
@@ -839,6 +909,99 @@ fn plot_signal(
         }
 
         let bounds = plot_ui.plot_bounds();
+
+        // Threshold first, so the level and its regions sit under the markers
+        // rather than hiding them.
+        if let Some(level) = analysis.threshold {
+            plot_ui.hline(
+                HLine::new(level as f64)
+                    .name("threshold")
+                    .color(THRESHOLD)
+                    .width(1.0_f32),
+            );
+            let crossings = peaks::find_crossings(buckets, level, analysis.edge);
+            if !crossings.is_empty() {
+                // How long the trace spent past the level is usually the
+                // point of setting one, so it is reported rather than left to
+                // be counted by eye.
+                let total: f64 = crossings.iter().map(|c| c.duration()).sum();
+                let worst = crossings.iter().map(|c| c.peak).fold(f32::NAN, |a, b| {
+                    if a.is_nan() {
+                        b
+                    } else {
+                        match analysis.edge {
+                            Edge::Above => a.max(b),
+                            Edge::Below => a.min(b),
+                        }
+                    }
+                });
+                plot_ui.text(
+                    Text::new(
+                        PlotPoint::new(
+                            bounds.max()[0] - (bounds.max()[0] - bounds.min()[0]) * 0.012,
+                            level as f64,
+                        ),
+                        format!(
+                            "{} crossing(s) · {} total · peak {}",
+                            crossings.len(),
+                            fmt::si(total, "s"),
+                            fmt::si(worst as f64, unit)
+                        ),
+                    )
+                    .anchor(egui::Align2::RIGHT_BOTTOM)
+                    .color(THRESHOLD),
+                );
+            }
+            for c in crossings {
+                // A single-bucket region would be invisible as a rectangle,
+                // so give it the width of one bucket.
+                let w = (bounds.max()[0] - bounds.min()[0]) * 0.001;
+                let (lo, hi) = (c.start - w, c.end + w);
+                plot_ui.polygon(
+                    Polygon::new(PlotPoints::from(vec![
+                        [lo, bounds.min()[1]],
+                        [hi, bounds.min()[1]],
+                        [hi, bounds.max()[1]],
+                        [lo, bounds.max()[1]],
+                    ]))
+                    .name("over threshold")
+                    .fill_color(THRESHOLD.gamma_multiply(0.15))
+                    .stroke(egui::Stroke::NONE),
+                );
+            }
+        }
+
+        if let Some(limit) = analysis.peaks {
+            // Separation is a fraction of the view, so zooming in resolves
+            // peaks that were merged when zoomed out.
+            let separation = (bounds.max()[0] - bounds.min()[0]) * 0.02;
+            let found = peaks::find_peaks(buckets, separation, limit);
+            if !found.is_empty() {
+                plot_ui.points(
+                    Points::new(PlotPoints::from(
+                        found
+                            .iter()
+                            .map(|p| [p.t, p.value as f64])
+                            .collect::<Vec<_>>(),
+                    ))
+                    .name("peaks")
+                    .shape(MarkerShape::Diamond)
+                    .radius(4.0_f32)
+                    .color(PEAK),
+                );
+                for p in &found {
+                    plot_ui.text(
+                        Text::new(
+                            PlotPoint::new(p.t, p.value as f64),
+                            fmt::si(p.value as f64, unit),
+                        )
+                        .anchor(egui::Align2::CENTER_BOTTOM)
+                        .color(PEAK),
+                    );
+                }
+            }
+        }
+
         if let (Some(a), Some(b)) = markers {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             plot_ui.polygon(

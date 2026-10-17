@@ -14,6 +14,7 @@ mod acquire;
 mod app;
 mod buffer;
 mod fmt;
+mod peaks;
 mod raw;
 
 fn main() -> eframe::Result<()> {
