@@ -347,6 +347,13 @@ pub struct Js220 {
     /// ADC channels standing in for the current and voltage slots while
     /// streaming [`Source::RawAdc`].
     adc_map: Option<(u8, u8)>,
+    /// The range mode that means on, so the power switch restores whichever
+    /// of auto or manual the caller configured.
+    range_mode_on: u8,
+    /// The manual range index to restore alongside it.
+    range_select_on: u8,
+    /// Whether the current path to the target is closed.
+    target_power: bool,
     config: Option<StreamConfig>,
     params: HashMap<String, Value>,
     statistics: Option<Statistics>,
@@ -406,6 +413,9 @@ impl Js220 {
             scratch: Vec::new(),
             adc_scratch: Vec::new(),
             adc_map: None,
+            range_mode_on: RANGE_MODE_AUTO,
+            range_select_on: 0,
+            target_power: true,
             config: None,
             params: HashMap::new(),
             statistics: None,
@@ -618,6 +628,45 @@ impl Js220 {
         self.link.send_frame(frame::PORT_PUBSUB, &payload)
     }
 
+    /// Open or close the current path through the instrument.
+    ///
+    /// The JS220 sits in series with the target, so the current ranging
+    /// MOSFETs are also the target supply switch: turning ranging off opens
+    /// the circuit and the target loses power. That is a real action on the
+    /// hardware attached to the instrument, not a display setting, and it will
+    /// reset whatever is powered through it.
+    ///
+    /// Turning it back on restores whichever of auto or manual ranging the
+    /// last [`Js220::stream_start`] configured.
+    pub fn set_target_power(&mut self, on: bool) -> Result<()> {
+        if on {
+            self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(self.range_mode_on))?;
+            if self.range_mode_on == RANGE_MODE_MANUAL {
+                self.publish(
+                    topics::S_CURRENT_RANGE_SELECT,
+                    Value::U8(current_range_select(self.range_select_on)),
+                )?;
+            }
+        } else {
+            // The instrument's own metadata names mode 0 "off", so that is
+            // what is published. Selecting an empty range bitmap instead was
+            // tried and is worse: it leaves the amplifier reading nothing in
+            // particular and reported 252 mA through a supposedly open path.
+            //
+            // Whether this actually removes power from the target is not
+            // confirmed. Current cannot be used to check, because with no
+            // range engaged the reading is meaningless either way.
+            self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_OFF))?;
+        }
+        self.target_power = on;
+        Ok(())
+    }
+
+    /// Whether the current path to the target is closed.
+    pub fn target_power(&self) -> bool {
+        self.target_power
+    }
+
     /// Configure and start streaming.
     pub fn stream_start(&mut self, config: StreamConfig) -> Result<()> {
         config.validate()?;
@@ -631,9 +680,18 @@ impl Js220 {
         // current front end not ranging. Leaving these topics alone yields a
         // link that connects and acknowledges everything while producing no
         // current samples at all.
+        // Remember which mode means on, so the power switch can restore it.
+        self.range_mode_on = match config.current_range {
+            CurrentRange::Manual(_) => RANGE_MODE_MANUAL,
+            _ => RANGE_MODE_AUTO,
+        };
+        if let CurrentRange::Manual(n) = config.current_range {
+            self.range_select_on = n;
+        }
         match config.current_range {
             CurrentRange::Auto => {
                 self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_AUTO))?;
+                self.target_power = true;
             }
             CurrentRange::Manual(n) => {
                 if n > 5 {
@@ -646,9 +704,11 @@ impl Js220 {
                     topics::S_CURRENT_RANGE_SELECT,
                     Value::U8(current_range_select(n)),
                 )?;
+                self.target_power = true;
             }
             CurrentRange::Off => {
                 self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_OFF))?;
+                self.target_power = false;
             }
         }
 

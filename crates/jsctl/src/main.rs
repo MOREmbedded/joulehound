@@ -45,6 +45,8 @@ enum Command {
     Topics(TopicsArgs),
     /// Issue a USB reset, recovering a device left in a bad state.
     Reset(DeviceArgs),
+    /// Open or close the current path to the target.
+    Power(PowerArgs),
     /// Print on-instrument statistics as they arrive.
     Stats(StatsArgs),
     /// Stream samples to a file.
@@ -192,6 +194,32 @@ impl StreamArgs {
 }
 
 #[derive(Args)]
+struct PowerArgs {
+    #[command(flatten)]
+    device: DeviceArgs,
+
+    /// Whether the target should be powered.
+    #[arg(value_enum)]
+    state: PowerState,
+
+    /// Hold the setting for this many seconds before exiting.
+    ///
+    /// The instrument reverts when the host disconnects, so a bare switch
+    /// would spring back the moment this command returned.
+    // No short form: -h belongs to help.
+    #[arg(long, default_value_t = 5.0, value_name = "SECONDS")]
+    hold: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PowerState {
+    /// Close the path and power the target.
+    On,
+    /// Open the path. The target loses power and will reset.
+    Off,
+}
+
+#[derive(Args)]
 struct TopicsArgs {
     #[command(flatten)]
     device: DeviceArgs,
@@ -266,6 +294,7 @@ fn main() -> Result<()> {
         Command::Info(args) => cmd_info(&args),
         Command::Topics(args) => cmd_topics(&args),
         Command::Reset(args) => cmd_reset(&args),
+        Command::Power(args) => cmd_power(&args),
         Command::Stats(args) => cmd_stats(&args),
         Command::Capture(args) => cmd_capture(&args),
         Command::Bench(args) => cmd_bench(&args),
@@ -351,6 +380,62 @@ fn cmd_reset(args: &DeviceArgs) -> Result<()> {
         Ok(d) => println!("{} is back", d.serial()),
         Err(e) => println!("device has not reappeared yet ({e}); give it a moment"),
     }
+    Ok(())
+}
+
+fn cmd_power(args: &PowerArgs) -> Result<()> {
+    let mut dev = args.device.open()?;
+    let on = args.state == PowerState::On;
+
+    // The switch only has an effect while a stream is configured, since that
+    // is what sets the ranging mode it overrides.
+    let mut cfg = StreamConfig {
+        signals: vec![Signal::Current, Signal::Voltage],
+        ..Default::default()
+    };
+    cfg.statistics = false;
+    dev.stream_start(cfg)
+        .context("configuring the instrument")?;
+
+    dev.set_target_power(on).context("switching target power")?;
+    eprintln!(
+        "target power {}",
+        if on {
+            "ON"
+        } else {
+            "OFF (the target has lost power)"
+        }
+    );
+
+    // Hold it, draining the stream so the device keeps running, and measure
+    // what the target is actually drawing. A switch that reports success but
+    // leaves current flowing has not done anything.
+    let deadline = Instant::now() + Duration::from_secs_f64(args.hold.max(0.0));
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    while Instant::now() < deadline {
+        dev.poll(POLL_TIMEOUT)?;
+        let rows = dev.rows();
+        let n = rows.len;
+        if let Some(current) = rows.current {
+            for v in &current[..n] {
+                if v.is_finite() {
+                    sum += *v as f64;
+                    count += 1;
+                }
+            }
+        }
+        dev.consume(n);
+    }
+    if count > 0 {
+        println!("measured current {}", fmt::si(sum / count as f64, "A"));
+    } else {
+        println!("no current samples arrived");
+    }
+    eprintln!(
+        "held for {:.1} s; the instrument reverts on disconnect",
+        args.hold
+    );
     Ok(())
 }
 

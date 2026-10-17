@@ -413,6 +413,28 @@ impl App {
                         path: std::path::PathBuf::from(self.record_path.clone()),
                     });
                 }
+                ui.separator();
+                // Sitting in series with the target makes the ranging MOSFETs
+                // its supply switch, so this really does cut power to whatever
+                // is attached. Coloured and labelled accordingly rather than
+                // looking like a display option.
+                let on = shared.target_power;
+                let (label, colour) = if on {
+                    ("⏻ Target ON", egui::Color32::from_rgb(120, 220, 120))
+                } else {
+                    ("⏻ Target OFF", egui::Color32::from_rgb(240, 120, 120))
+                };
+                let button = egui::Button::new(egui::RichText::new(label).color(colour).strong());
+                if ui
+                    .add_enabled(running, button)
+                    .on_hover_text(
+                        "Open or close the current path. Switching off removes power                          from the target and will reset it.",
+                    )
+                    .clicked()
+                {
+                    self.acq.send(Command::SetTargetPower { on: !on });
+                }
+
                 ui.toggle_value(&mut self.show_log, "Log");
             });
             ui.add_space(4.0);

@@ -61,6 +61,11 @@ pub enum Command {
     Stop,
     /// Discard the displayed history.
     ClearTraces,
+    /// Open or close the current path to the target.
+    SetTargetPower {
+        /// True to close the path and power the target.
+        on: bool,
+    },
     /// Begin writing samples to `path`.
     RecordStart {
         /// Destination file.
@@ -145,6 +150,8 @@ pub struct Shared {
     /// The acquisition path currently streaming, which decides whether the
     /// samples are physical units or raw counts.
     pub source: Source,
+    /// Whether the current path to the target is closed.
+    pub target_power: bool,
 }
 
 /// One line in the GUI log pane.
@@ -195,6 +202,7 @@ impl Shared {
             log: Vec::new(),
             bucket_seconds: 0.001,
             source: Source::Calibrated,
+            target_power: true,
         }
     }
 
@@ -375,6 +383,7 @@ fn handle_command(
                         Source::Calibrated => rate,
                     };
                     s.source = source;
+                    s.target_power = true;
                     s.bucket_seconds = bucket_seconds_for(effective);
                     s.reconfigure_raw(1.0 / effective.max(1) as f64);
                     s.status = Status::Running;
@@ -398,6 +407,40 @@ fn handle_command(
         Command::ClearTraces => {
             let mut s = shared.lock().expect("shared snapshot poisoned");
             s.clear_traces();
+        }
+        Command::SetTargetPower { on } => {
+            let Some(active) = session.as_mut() else {
+                let mut s = shared.lock().expect("shared snapshot poisoned");
+                s.push_log(
+                    LogLevel::Warn,
+                    "not connected; cannot switch power",
+                    started,
+                );
+                return;
+            };
+            match active.device.set_target_power(on) {
+                Ok(()) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.target_power = on;
+                    s.push_log(
+                        LogLevel::Info,
+                        if on {
+                            "target power on"
+                        } else {
+                            "target power OFF"
+                        },
+                        started,
+                    );
+                }
+                Err(e) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.push_log(
+                        LogLevel::Error,
+                        format!("power switch failed: {e}"),
+                        started,
+                    );
+                }
+            }
         }
         Command::RecordStart { path } => {
             let Some(active) = session.as_mut() else {
