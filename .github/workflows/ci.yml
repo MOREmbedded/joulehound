@@ -1,0 +1,55 @@
+name: CI
+
+# Windows only, because that is the only platform this has been verified on.
+# nusb supports Linux and macOS and nothing here is Windows-specific beyond
+# the WinUSB binding, but a green badge should mean something was actually
+# tested, not that it compiled somewhere nobody has run it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings fail the build here, as they do locally.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # rust-toolchain.toml pins it; this just makes the components explicit.
+        run: rustup component add rustfmt clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        # No hardware on a runner, so these are the host-side tests only:
+        # codecs, buffers, aggregation, detection, export and CLI parsing.
+        # Everything needing a JS220 is measured by hand and written up in
+        # the README.
+        run: cargo test --workspace --all-targets
+
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+      - name: Release build
+        run: cargo build --workspace --release

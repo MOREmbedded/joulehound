@@ -18,11 +18,25 @@ crates/
 
 ![jsgui](docs/jsgui.png)
 
+Current, voltage and power over an accumulating time axis, three logic inputs
+beneath them on the same axis, and a marker pair with its measurements.
+
 ## Status
 
-Working and verified on hardware. Streams at the full 1 Msps on current and
-voltage simultaneously — **7.75 MiB/s sustained, 100% of the requested rate** —
-and captures to disk at every supported rate from 1 kHz to 1 Msps.
+Working and verified on hardware, on Windows. Streams current and voltage
+together at the full 1 Msps — **100% of the requested rate, 7.75 MiB/s
+sustained** — reaches **2 Msps** through the raw ADC path, captures all five
+general purpose inputs at 2 Msps alongside them, and records to disk at every
+rate from 1 kHz up.
+
+The GUI plots, zooms to individual samples, measures between markers, finds
+peaks and threshold crossings, exports to CSV and xlsx, and drives the
+instrument's own settings. [What has and has not been
+verified](#verification) is set out below, including the things this cannot
+confirm without hardware it does not have.
+
+Not released anywhere yet: no crates.io publication, no tagged version, no CI.
+Linux and macOS are untested — see [platform notes](#platform-notes).
 
 ## Build
 
@@ -198,6 +212,8 @@ says disabling them is at your own risk.
 `jsctl set <topic> <value>` publishes to any of these directly, and `--verify`
 reads the instrument's own value back afterwards — which is how every setting
 here was checked.
+
+![device panel](docs/device.png)
 
 **Stop does not disturb the target.** Stopping closes the instrument's data
 ports but keeps the device open, so the current path stays shut and whatever
@@ -417,8 +433,15 @@ no libusb.
   installer does. WinUSB permits a single handle per interface, so **close the
   Joulescope UI before using `jsctl`**; otherwise opening fails with access
   denied.
-- **Linux** — needs a udev rule granting access to `16d0:10ba`.
-- **macOS** — no additional setup.
+- **Linux** — needs a udev rule granting access to `16d0:10ba`. **Untested.**
+  Nothing here is Windows-specific beyond that binding, and `nusb` supports
+  Linux, but this has never been built or run there.
+- **macOS** — `nusb` needs no additional setup. **Untested**, as above.
+
+Everything in [Verification](#verification) was measured on Windows 11 with
+one JS220, serial 005636, firmware 1.3.0 and FPGA 1.3.3. A second instrument
+has never been attached, so multi-device selection is exercised only by the
+`--serial` plumbing and its unit tests.
 
 ## Relationship to the official driver
 
@@ -433,4 +456,10 @@ a trademark of Jetperch LLC.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).
+
+Dependencies are listed in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md). All 150 are permissive:
+no copyleft, and nothing obliging a user of these binaries to publish their
+own source.
