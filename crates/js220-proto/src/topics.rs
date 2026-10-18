@@ -124,6 +124,110 @@ pub const S_GPI_REQUEST: &str = "s/gpi/+/!req";
 /// Whether the trigger line is an input or an output.
 pub const C_TRIGGER_DIR: &str = "c/trigger/dir";
 
+/// Downsampling filter used between 2 MHz and 1 MHz.
+///
+/// `0` is wideband, `1` a first-order sinc. Wideband keeps the bandwidth and
+/// lets aliases through; sinc1 trades bandwidth for rejecting them.
+pub const S_DOWNSAMPLE_MODE: &str = "s/dwn2/mode";
+
+/// How the general purpose inputs are downsampled.
+///
+/// `0` off, `1` toggle, `2` first, `3` majority. Published to the literal
+/// `+` topic, which applies it to every line at once.
+pub const S_GPI_FILTER_MODE: &str = "s/gpi/+/dwnN/mode";
+
+/// Downsample factor applied to the general purpose inputs, 0 to 2047.
+pub const S_GPI_FILTER_N: &str = "s/gpi/+/dwnN/N";
+
+/// Which line the timesync pulse-per-second is taken from.
+pub const S_PPS_INPUT: &str = "s/ts/pps_in";
+
+/// Make-before-break MOSFET counter, in current-range switch cycles.
+pub const S_RANGE_MB4B: &str = "s/i/range/mb4b";
+
+/// Compensation for the most sensitive current range.
+pub const S_RANGE_S5_COMPENSATION: &str = "s/i/range/s5_cmp";
+
+/// Whether the ADC forwards samples or a summary.
+pub const S_RANGE_ADC_FORWARD: &str = "s/i/range/adc_fwd";
+
+/// Enable software control of the controller's status LED.
+pub const C_LED_ENABLE: &str = "c/led/en";
+
+/// Blink pattern for one of the controller's LEDs.
+///
+/// `None` for any colour the instrument does not have.
+pub fn led_controller(colour: &str) -> Option<&'static str> {
+    Some(match colour {
+        "red" => "c/led/red",
+        "green" => "c/led/green",
+        "blue" => "c/led/blue",
+        _ => return None,
+    })
+}
+
+/// Enable software control of the sensor's LED.
+pub const S_LED_ENABLE: &str = "s/led/en";
+
+/// Blink pattern for one of the sensor's LEDs.
+pub fn led_sensor(colour: &str) -> Option<&'static str> {
+    Some(match colour {
+        "red" => "s/led/red",
+        "green" => "s/led/green",
+        "blue" => "s/led/blue",
+        _ => return None,
+    })
+}
+
+/// Clear every engaged fuse at once.
+pub const S_FUSE_CLEAR_ALL: &str = "s/fuse/+/!clear";
+
+/// Fuses the instrument exposes.
+///
+/// 0 and 1 are yours to configure. 30 and 31 are the instrument's own
+/// protection, and its metadata says disabling them is at your own risk.
+pub const FUSES: [u8; 4] = [0, 1, 30, 31];
+
+/// Enable topic for fuse `n`.
+pub fn fuse_enable(n: u8) -> Option<&'static str> {
+    Some(match n {
+        0 => "s/fuse/0/en",
+        1 => "s/fuse/1/en",
+        30 => "s/fuse/30/en",
+        31 => "s/fuse/31/en",
+        _ => return None,
+    })
+}
+
+/// Engaged topic for fuse `n`: reads 1 when tripped, write 0 to clear it.
+pub fn fuse_engaged(n: u8) -> Option<&'static str> {
+    Some(match n {
+        0 => "s/fuse/0/engaged",
+        1 => "s/fuse/1/engaged",
+        30 => "s/fuse/30/engaged",
+        31 => "s/fuse/31/engaged",
+        _ => return None,
+    })
+}
+
+/// Accumulation constant for fuse `n`, in 4q14 fixed point.
+pub fn fuse_accumulation(n: u8) -> Option<&'static str> {
+    Some(match n {
+        0 => "s/fuse/0/F",
+        1 => "s/fuse/1/F",
+        _ => return None,
+    })
+}
+
+/// Dissipation constant for fuse `n`, in 8q10 fixed point.
+pub fn fuse_dissipation(n: u8) -> Option<&'static str> {
+    Some(match n {
+        0 => "s/fuse/0/K",
+        1 => "s/fuse/1/K",
+        _ => return None,
+    })
+}
+
 /// Build the control topic for raw ADC channel `n`, 0 through 3.
 pub fn adc_ctrl(n: u8) -> Option<&'static str> {
     Some(match n {

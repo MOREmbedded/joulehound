@@ -53,6 +53,9 @@ jsctl capture -o run.f32 --rate 1000000 --signals i,v,p --duration 10
 # Same, as CSV
 jsctl capture -o run.csv --format csv --rate 1000 --duration 10
 
+# Change one setting and confirm the instrument took it
+jsctl set s/i/range/mb4b 20 --verify
+
 # Read the logic inputs, and drive the outputs
 jsctl gpio --gpio-vref 3v3 --set 0b11 --reads 3
 
@@ -175,10 +178,26 @@ trace it describes.
 **Device panel.** `Device` opens the instrument's own settings beside the
 plots: current range (auto, a pinned range, or off), the bounds autoranging
 may choose between, voltage range, what the GPIO inputs compare against, the
-general purpose outputs, whether the trigger line drives or senses, and a
-button to reset the charge and energy accumulators. Everything there applies
-immediately rather than at the next start, because these are questions about
-the measurement and the answer is wanted while watching it.
+general purpose outputs, whether the trigger line drives or senses, the
+2 MHz-to-1 MHz filter, the GPI filter and its factor, the statistics rate, and
+a button to reset the charge and energy accumulators. Folded away below are
+the fuses, host-side scaling, and the settings that are rarely touched:
+pulse-per-second input, make-before-break overlap, compensation on the most
+sensitive range, ADC summary forwarding and the status LEDs. Everything
+applies immediately rather than at the next start, because these are questions
+about the measurement and the answer is wanted while watching it.
+
+The **fuses** are configured by their own constants — `F` in 4q14 and `K` in
+8q10 — rather than by a current and a duration. The instrument software offers
+the friendlier pair and converts, but that conversion is not published in the
+driver, the datasheet or the user's guide, and the constants of a protective
+device are not something to guess at quietly. Enabling, disabling and clearing
+work normally, including the instrument's own fuses 30 and 31, whose metadata
+says disabling them is at your own risk.
+
+`jsctl set <topic> <value>` publishes to any of these directly, and `--verify`
+reads the instrument's own value back afterwards — which is how every setting
+here was checked.
 
 **Stop does not disturb the target.** Stopping closes the instrument's data
 ports but keeps the device open, so the current path stays shut and whatever
@@ -281,6 +300,7 @@ round-tripping through real files.
 | Capture, 1 ksps CSV | 1,999 rows in 2.001 s, sample ids advancing by 2000 |
 | GPI, all five lines | **2.00 Msps each**, 0 filled, 0 discontinuities, at 8.72 MiB/s |
 | GUI, three logic lines | 1.01 M samples/s at 8.53 MiB/s |
+| Device settings | **12 of 12** read back exactly as set, across ranges, filters, fuses, LEDs and statistics |
 | Target power switch | **10 of 10 toggles**, device's own `s/i/range/mode` reading 0 and 4 exactly as asked |
 | Stream restart, device held open | **0.35 s**, target current continuous across it (was 1.29 s) |
 | GUI, all five logic lines | 1.08 M samples/s at 9.73 MiB/s, 2 min 47 s unbroken, no frame errors, ~1.15 cores |

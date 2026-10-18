@@ -417,6 +417,10 @@ pub struct Js220 {
     gpi: Vec<GpiChannel>,
     /// Pattern the general purpose outputs were last driven to.
     gpo: u32,
+    /// Multiplier applied to calibrated current as it arrives.
+    i_scale: f32,
+    /// Multiplier applied to calibrated voltage as it arrives.
+    v_scale: f32,
     /// Reused decode buffer for unpacked GPI bits.
     gpi_scratch: Vec<u8>,
     /// The range mode that means on, so the power switch restores whichever
@@ -487,6 +491,8 @@ impl Js220 {
             adc_map: None,
             gpi: Vec::new(),
             gpo: 0,
+            i_scale: 1.0,
+            v_scale: 1.0,
             gpi_scratch: Vec::new(),
             range_mode_on: RANGE_MODE_AUTO,
             range_select_on: 0,
@@ -884,6 +890,223 @@ impl Js220 {
     pub fn set_gpio_vref(&mut self, vref: GpioVref) -> Result<()> {
         self.publish(topics::C_GPIO_VREF, Value::U8(vref.code()))?;
         self.sync_output()
+    }
+}
+
+/// Filter applied when the instrument halves its 2 MHz rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignalFilter {
+    /// Keep the bandwidth, and with it the aliases.
+    #[default]
+    Wideband,
+    /// First-order sinc: narrower, but rejects what wideband folds back.
+    Sinc1,
+}
+
+impl SignalFilter {
+    /// The value the downsampling mode topic takes.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Wideband => 0,
+            Self::Sinc1 => 1,
+        }
+    }
+}
+
+/// How a general purpose input is reduced when it is downsampled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpiFilter {
+    /// No filtering.
+    #[default]
+    Off,
+    /// Report a toggle if the line moved at all within the window.
+    Toggle,
+    /// Take the first sample of the window.
+    First,
+    /// Take whichever level held for most of the window.
+    Majority,
+}
+
+impl GpiFilter {
+    /// The value the GPI downsampling mode topic takes.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Toggle => 1,
+            Self::First => 2,
+            Self::Majority => 3,
+        }
+    }
+}
+
+impl Js220 {
+    /// Choose the filter used when halving the instrument's base rate.
+    pub fn set_signal_filter(&mut self, filter: SignalFilter) -> Result<()> {
+        self.publish(topics::S_DOWNSAMPLE_MODE, Value::U32(filter.code()))?;
+        self.sync_output()
+    }
+
+    /// Choose how the general purpose inputs are reduced, and by how much.
+    ///
+    /// A factor of 1 leaves them at the full rate whatever the mode says.
+    pub fn set_gpi_filter(&mut self, filter: GpiFilter, factor: u32) -> Result<()> {
+        if factor > 2047 {
+            return Err(Error::Config {
+                reason: format!("GPI downsample factor {factor} is outside 0..=2047"),
+            });
+        }
+        self.publish(topics::S_GPI_FILTER_MODE, Value::U32(filter.code()))?;
+        self.publish(topics::S_GPI_FILTER_N, Value::U32(factor.max(1)))?;
+        self.sync_output()
+    }
+
+    /// Choose which line carries the timesync pulse-per-second.
+    pub fn set_pps_input(&mut self, line: u8) -> Result<()> {
+        if pstream::gpi_index(line).is_none() {
+            return Err(Error::Config {
+                reason: format!("line {line} cannot carry the pulse-per-second"),
+            });
+        }
+        self.publish(topics::S_PPS_INPUT, Value::U32(line as u32))?;
+        self.sync_output()
+    }
+
+    /// Set the make-before-break counter used when switching current ranges.
+    ///
+    /// Longer overlap suppresses the glitch a range change leaves behind, at
+    /// the cost of briefly engaging two shunts at once.
+    pub fn set_range_overlap(&mut self, cycles: u8) -> Result<()> {
+        self.publish(topics::S_RANGE_MB4B, Value::U8(cycles))?;
+        self.sync_output()
+    }
+
+    /// Enable compensation on the most sensitive current range.
+    pub fn set_range_compensation(&mut self, on: bool) -> Result<()> {
+        self.publish(topics::S_RANGE_S5_COMPENSATION, Value::U8(u8::from(on)))?;
+        self.sync_output()
+    }
+
+    /// Have the ADC forward a summary rather than individual samples.
+    pub fn set_adc_summary(&mut self, summary: bool) -> Result<()> {
+        self.publish(topics::S_RANGE_ADC_FORWARD, Value::U8(u8::from(summary)))?;
+        self.sync_output()
+    }
+
+    /// Drive the instrument's status LEDs, or hand them back to it.
+    ///
+    /// `None` returns them to the instrument's own control. Otherwise each
+    /// value is a blink pattern for that colour.
+    pub fn set_leds(&mut self, sensor: bool, pattern: Option<(u8, u8, u8)>) -> Result<()> {
+        let (enable, red, green, blue) = if sensor {
+            (
+                topics::S_LED_ENABLE,
+                topics::led_sensor("red"),
+                topics::led_sensor("green"),
+                topics::led_sensor("blue"),
+            )
+        } else {
+            (
+                topics::C_LED_ENABLE,
+                topics::led_controller("red"),
+                topics::led_controller("green"),
+                topics::led_controller("blue"),
+            )
+        };
+        match pattern {
+            Some((r, g, b)) => {
+                self.publish(enable, Value::U8(1))?;
+                for (topic, value) in [(red, r), (green, g), (blue, b)] {
+                    if let Some(topic) = topic {
+                        self.publish(topic, Value::U8(value))?;
+                    }
+                }
+            }
+            None => self.publish(enable, Value::U8(0))?,
+        }
+        self.sync_output()
+    }
+
+    /// Enable or disable one of the instrument's fuses.
+    ///
+    /// Fuses 30 and 31 are the instrument's own protection; its metadata says
+    /// disabling them is at your own risk, and this does not stop you.
+    pub fn set_fuse_enabled(&mut self, fuse: u8, on: bool) -> Result<()> {
+        let topic = topics::fuse_enable(fuse).ok_or_else(|| Error::Config {
+            reason: format!("there is no fuse {fuse}"),
+        })?;
+        self.publish(topic, Value::U8(u8::from(on)))?;
+        self.sync_output()
+    }
+
+    /// Set a fuse's accumulation and dissipation constants.
+    ///
+    /// These are the raw fixed-point values the instrument takes: `f` is
+    /// 4q14 and `k` is 8q10. The instrument software presents a threshold and
+    /// a duration instead and converts them, but that conversion is not
+    /// published anywhere this driver could check it, and guessing at the
+    /// constants of a protective device is not something to do quietly.
+    pub fn set_fuse_constants(&mut self, fuse: u8, f: u32, k: u32) -> Result<()> {
+        let (ft, kt) = (
+            topics::fuse_accumulation(fuse),
+            topics::fuse_dissipation(fuse),
+        );
+        let (Some(ft), Some(kt)) = (ft, kt) else {
+            return Err(Error::Config {
+                reason: format!("fuse {fuse} has no configurable constants"),
+            });
+        };
+        self.publish(ft, Value::U32(f))?;
+        self.publish(kt, Value::U32(k))?;
+        self.sync_output()
+    }
+
+    /// Clear a fuse that has tripped, or every one of them.
+    pub fn clear_fuse(&mut self, fuse: Option<u8>) -> Result<()> {
+        match fuse {
+            Some(n) => {
+                let topic = topics::fuse_engaged(n).ok_or_else(|| Error::Config {
+                    reason: format!("there is no fuse {n}"),
+                })?;
+                self.publish(topic, Value::U8(0))?;
+            }
+            None => self.publish(topics::S_FUSE_CLEAR_ALL, Value::U8(1))?,
+        }
+        self.sync_output()
+    }
+
+    /// Set how many 1 Msps samples go into each statistics block.
+    pub fn set_statistics_block(&mut self, samples: u32) -> Result<()> {
+        if samples == 0 {
+            return Err(Error::Config {
+                reason: "a statistics block cannot be empty".into(),
+            });
+        }
+        self.publish(topics::S_STATS_SCNT, Value::U32(samples))?;
+        self.sync_output()
+    }
+
+    /// Scale the calibrated current and voltage as they arrive.
+    ///
+    /// For correcting a known gain error, such as a shunt or divider between
+    /// the instrument and the target. Power follows, since it is computed
+    /// from the scaled pair. Raw ADC counts are left alone: they are not a
+    /// measurement to correct.
+    pub fn set_scales(&mut self, current: f32, voltage: f32) -> Result<()> {
+        for (name, value) in [("current", current), ("voltage", voltage)] {
+            if !value.is_finite() || value == 0.0 {
+                return Err(Error::Config {
+                    reason: format!("{name} scale {value} is not usable"),
+                });
+            }
+        }
+        self.i_scale = current;
+        self.v_scale = voltage;
+        Ok(())
+    }
+
+    /// The scales currently applied to current and voltage.
+    pub fn scales(&self) -> (f32, f32) {
+        (self.i_scale, self.v_scale)
     }
 
     /// Choose whether the trigger line is an input or an output.
@@ -1325,6 +1548,18 @@ impl Js220 {
             self.adc_scratch = counts;
         } else {
             pstream::decode_f32(data, &mut scratch);
+            // Applied here, where the reference driver applies it, so power
+            // computed downstream is consistent with the scaled operands.
+            let scale = match signal {
+                Signal::Current => self.i_scale,
+                Signal::Voltage => self.v_scale,
+                Signal::Power => 1.0,
+            };
+            if scale != 1.0 {
+                for v in scratch.iter_mut() {
+                    *v *= scale;
+                }
+            }
         }
         self.group.push(signal, raw_id, &scratch);
         self.scratch = scratch;
@@ -1523,6 +1758,59 @@ mod tests {
         assert!(cfg(999).validate().is_err(), "below the minimum");
         assert!(cfg(2_000_000).validate().is_err(), "above the maximum");
         assert!(cfg(300_000).validate().is_err(), "does not divide 2 MHz");
+    }
+
+    #[test]
+    fn filter_codes_match_the_instrument_metadata() {
+        // s/dwn2/mode: [0=wideband, 1=sinc1]
+        assert_eq!(SignalFilter::Wideband.code(), 0);
+        assert_eq!(SignalFilter::Sinc1.code(), 1);
+        // s/gpi/+/dwnN/mode: [0=off, 1=toggle, 2=first, 3=majority]
+        assert_eq!(GpiFilter::Off.code(), 0);
+        assert_eq!(GpiFilter::Toggle.code(), 1);
+        assert_eq!(GpiFilter::First.code(), 2);
+        assert_eq!(GpiFilter::Majority.code(), 3);
+    }
+
+    #[test]
+    fn the_defaults_are_the_instrument_defaults() {
+        assert_eq!(SignalFilter::default(), SignalFilter::Wideband);
+        assert_eq!(GpiFilter::default(), GpiFilter::Off);
+        assert_eq!(GpioVref::default(), GpioVref::External);
+    }
+
+    #[test]
+    fn the_gpio_reference_codes_match_the_metadata() {
+        // c/gpio/vref: [0=external, 1=3v3]
+        assert_eq!(GpioVref::External.code(), 0);
+        assert_eq!(GpioVref::V3p3.code(), 1);
+    }
+
+    #[test]
+    fn every_fuse_the_instrument_lists_has_its_topics() {
+        for &n in &topics::FUSES {
+            assert!(topics::fuse_enable(n).is_some(), "fuse {n} enable");
+            assert!(topics::fuse_engaged(n).is_some(), "fuse {n} engaged");
+        }
+        // Only 0 and 1 take constants; 30 and 31 are the instrument's own.
+        for n in [0u8, 1] {
+            assert!(topics::fuse_accumulation(n).is_some());
+            assert!(topics::fuse_dissipation(n).is_some());
+        }
+        for n in [30u8, 31] {
+            assert!(topics::fuse_accumulation(n).is_none());
+            assert!(topics::fuse_dissipation(n).is_none());
+        }
+        assert!(topics::fuse_enable(2).is_none(), "there is no fuse 2");
+    }
+
+    #[test]
+    fn every_led_colour_resolves_on_both_sides() {
+        for colour in ["red", "green", "blue"] {
+            assert!(topics::led_controller(colour).is_some(), "{colour}");
+            assert!(topics::led_sensor(colour).is_some(), "{colour}");
+        }
+        assert!(topics::led_controller("amber").is_none());
     }
 
     #[test]

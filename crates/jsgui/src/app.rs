@@ -14,7 +14,7 @@ use crate::export::{self, Column};
 use crate::fmt;
 use crate::peaks::{self, Edge};
 use crate::raw::RawTrace;
-use js220::device::{CurrentRange, GpioVref, Source, VoltageRange};
+use js220::device::{CurrentRange, GpiFilter, GpioVref, SignalFilter, Source, VoltageRange};
 
 /// Sample rates offered in the toolbar. Every one divides 2 MHz exactly.
 const RATES: [u32; 8] = [
@@ -210,6 +210,30 @@ pub struct App {
     gpo: u32,
     /// Whether the trigger line is driven rather than sensed.
     trigger_output: bool,
+    /// Filter used when the instrument halves its base rate.
+    signal_filter: SignalFilter,
+    /// How the general purpose inputs are reduced, and by how much.
+    gpi_filter: (GpiFilter, u32),
+    /// Line carrying the timesync pulse-per-second.
+    pps_input: u8,
+    /// Make-before-break overlap when switching current ranges.
+    range_overlap: u8,
+    /// Compensation on the most sensitive current range.
+    range_compensation: bool,
+    /// Whether the ADC forwards a summary rather than samples.
+    adc_summary: bool,
+    /// Controller LED pattern, or None while the instrument owns them.
+    leds: Option<(u8, u8, u8)>,
+    /// Which fuses are enabled, in the order [`FUSES`] lists them.
+    fuse_enabled: [bool; 4],
+    /// Raw constants for the two configurable fuses.
+    fuse_constants: [(u32, u32); 2],
+    /// Statistics blocks per second.
+    statistics_rate: f64,
+    /// Multipliers applied to current and voltage.
+    scales: (f32, f32),
+    /// A label for this instrument, kept by the host.
+    device_name: String,
 }
 
 /// The instrument's current ranges, least sensitive first.
@@ -302,6 +326,19 @@ impl App {
             voltage_range: VoltageRange::Auto,
             gpo: 0,
             trigger_output: false,
+            signal_filter: SignalFilter::Wideband,
+            gpi_filter: (GpiFilter::Off, 1),
+            pps_input: 7,
+            range_overlap: 15,
+            range_compensation: false,
+            adc_summary: false,
+            leds: None,
+            // 30 and 31 are the instrument's own protection and start on.
+            fuse_enabled: [false, false, true, true],
+            fuse_constants: [(0, 0), (0, 0)],
+            statistics_rate: 2.0,
+            scales: (1.0, 1.0),
+            device_name: String::new(),
         };
         app.rescan();
         if autostart && app.serial.is_some() {
@@ -1000,7 +1037,7 @@ impl App {
         };
 
         egui::SidePanel::right("device")
-            .default_width(250.0)
+            .default_width(268.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -1020,6 +1057,8 @@ impl App {
                 }
                 ui.separator();
 
+                // Taller than the window on a small screen, so it scrolls.
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_enabled_ui(connected, |ui| {
                     ui.label("Current range");
                     let before = self.current_range;
@@ -1150,6 +1189,81 @@ impl App {
                     }
 
                     ui.separator();
+                    ui.label("Signal filter");
+                    let before = self.signal_filter;
+                    egui::ComboBox::from_id_salt("sig_filter")
+                        .width(150.0)
+                        .selected_text(match self.signal_filter {
+                            SignalFilter::Wideband => "wideband",
+                            SignalFilter::Sinc1 => "sinc1",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.signal_filter,
+                                SignalFilter::Wideband,
+                                "wideband",
+                            );
+                            ui.selectable_value(
+                                &mut self.signal_filter,
+                                SignalFilter::Sinc1,
+                                "sinc1",
+                            );
+                        })
+                        .response
+                        .on_hover_text(
+                            "Applied when the instrument halves its 2 MHz rate. Wideband keeps the bandwidth and lets aliases through; sinc1 trades bandwidth to reject them.",
+                        );
+                    if self.signal_filter != before {
+                        set(self, DeviceSetting::SignalFilter(self.signal_filter));
+                    }
+
+                    ui.label("GPI filter");
+                    let before = self.gpi_filter;
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("gpi_filter")
+                            .width(92.0)
+                            .selected_text(match self.gpi_filter.0 {
+                                GpiFilter::Off => "off",
+                                GpiFilter::Toggle => "toggle",
+                                GpiFilter::First => "first",
+                                GpiFilter::Majority => "majority",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (mode, name) in [
+                                    (GpiFilter::Off, "off"),
+                                    (GpiFilter::Toggle, "toggle"),
+                                    (GpiFilter::First, "first"),
+                                    (GpiFilter::Majority, "majority"),
+                                ] {
+                                    ui.selectable_value(&mut self.gpi_filter.0, mode, name);
+                                }
+                            });
+                        ui.add(
+                            egui::DragValue::new(&mut self.gpi_filter.1)
+                                .range(1..=2047)
+                                .speed(1.0)
+                                .prefix("÷"),
+                        );
+                    });
+                    if self.gpi_filter != before {
+                        let (mode, n) = self.gpi_filter;
+                        set(self, DeviceSetting::GpiFilter(mode, n));
+                    }
+
+                    ui.separator();
+                    ui.label("Statistics rate");
+                    let before = self.statistics_rate;
+                    ui.add(
+                        egui::DragValue::new(&mut self.statistics_rate)
+                            .range(0.1..=1000.0)
+                            .speed(0.1)
+                            .suffix(" Hz"),
+                    );
+                    if (self.statistics_rate - before).abs() > f64::EPSILON {
+                        // The instrument counts samples, not hertz.
+                        let block = (1_000_000.0 / self.statistics_rate).round() as u32;
+                        set(self, DeviceSetting::StatisticsBlock(block.max(1)));
+                    }
                     if ui
                         .button("Clear accumulators")
                         .on_hover_text("Reset the instrument's charge and energy totals")
@@ -1157,12 +1271,168 @@ impl App {
                     {
                         set(self, DeviceSetting::ClearAccumulators);
                     }
+
+                    ui.separator();
+                    ui.collapsing("Fuses", |ui| {
+                        ui.weak(
+                            "Thresholds are set as the instrument's own constants: F is 4q14, K is 8q10. The conversion its software uses from a current and a duration is not published, and this will not guess at the constants of a protective device.",
+                        );
+                        for (slot, fuse) in js220::proto::topics::FUSES.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let mut on = self.fuse_enabled[slot];
+                                let label = if *fuse >= 30 {
+                                    format!("Fuse {fuse} (instrument)")
+                                } else {
+                                    format!("Fuse {fuse}")
+                                };
+                                if ui.checkbox(&mut on, label).changed() {
+                                    self.fuse_enabled[slot] = on;
+                                    set(self, DeviceSetting::FuseEnabled(*fuse, on));
+                                }
+                                if ui.small_button("clear").clicked() {
+                                    set(self, DeviceSetting::ClearFuse(Some(*fuse)));
+                                }
+                            });
+                            if *fuse >= 30 {
+                                ui.weak("The instrument's own protection. Disabling it is at your own risk.");
+                                continue;
+                            }
+                            let before = self.fuse_constants[slot];
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.fuse_constants[slot].0)
+                                        .speed(1.0)
+                                        .prefix("F "),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.fuse_constants[slot].1)
+                                        .speed(1.0)
+                                        .prefix("K "),
+                                );
+                            });
+                            if self.fuse_constants[slot] != before {
+                                let (f, k) = self.fuse_constants[slot];
+                                set(self, DeviceSetting::FuseConstants(*fuse, f, k));
+                            }
+                        }
+                        if ui.button("Clear every fuse").clicked() {
+                            set(self, DeviceSetting::ClearFuse(None));
+                        }
+                    });
+
+                    ui.collapsing("Scaling", |ui| {
+                        ui.weak(
+                            "For a known gain between the instrument and the target, such as a shunt or divider. Power follows, since it is computed from the scaled pair.",
+                        );
+                        let before = self.scales;
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.scales.0)
+                                    .speed(0.01)
+                                    .prefix("current x"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.scales.1)
+                                    .speed(0.01)
+                                    .prefix("voltage x"),
+                            );
+                        });
+                        if self.scales != before {
+                            let (i, v) = self.scales;
+                            if i != 0.0 && v != 0.0 {
+                                set(self, DeviceSetting::Scales(i, v));
+                            }
+                        }
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut self.device_name)
+                            .on_hover_text("A label kept by this program, not by the instrument");
+                    });
+
+                    ui.collapsing("Advanced", |ui| {
+                        ui.label("Pulse-per-second input");
+                        let before = self.pps_input;
+                        egui::ComboBox::from_id_salt("pps")
+                            .width(92.0)
+                            .selected_text(gpi_name(self.pps_input))
+                            .show_ui(ui, |ui| {
+                                for line in js220::proto::stream::GPI_CHANNELS {
+                                    ui.selectable_value(
+                                        &mut self.pps_input,
+                                        line,
+                                        gpi_name(line),
+                                    );
+                                }
+                            });
+                        if self.pps_input != before {
+                            set(self, DeviceSetting::PpsInput(self.pps_input));
+                        }
+
+                        ui.label("Range switch overlap");
+                        let before = self.range_overlap;
+                        ui.add(
+                            egui::DragValue::new(&mut self.range_overlap)
+                                .range(0..=255)
+                                .speed(1.0)
+                                .suffix(" cycles"),
+                        )
+                        .on_hover_text(
+                            "Make-before-break. Longer overlap suppresses the glitch a range change leaves, at the cost of briefly engaging two shunts.",
+                        );
+                        if self.range_overlap != before {
+                            set(self, DeviceSetting::RangeOverlap(self.range_overlap));
+                        }
+
+                        let before = self.range_compensation;
+                        ui.checkbox(&mut self.range_compensation, "Compensate 18 uA range");
+                        if self.range_compensation != before {
+                            set(
+                                self,
+                                DeviceSetting::RangeCompensation(self.range_compensation),
+                            );
+                        }
+
+                        let before = self.adc_summary;
+                        ui.checkbox(&mut self.adc_summary, "ADC forwards a summary")
+                            .on_hover_text("Rather than individual samples");
+                        if self.adc_summary != before {
+                            set(self, DeviceSetting::AdcSummary(self.adc_summary));
+                        }
+
+                        ui.separator();
+                        ui.label("Status LEDs");
+                        let mut driven = self.leds.is_some();
+                        if ui.checkbox(&mut driven, "Driven by this program").changed() {
+                            self.leds = driven.then_some((0, 0, 0));
+                            set(
+                                self,
+                                DeviceSetting::Leds {
+                                    sensor: false,
+                                    pattern: self.leds,
+                                },
+                            );
+                        }
+                        if let Some(pattern) = self.leds.as_mut() {
+                            let before = *pattern;
+                            ui.horizontal(|ui| {
+                                ui.add(egui::DragValue::new(&mut pattern.0).prefix("R "));
+                                ui.add(egui::DragValue::new(&mut pattern.1).prefix("G "));
+                                ui.add(egui::DragValue::new(&mut pattern.2).prefix("B "));
+                            });
+                            if *pattern != before {
+                                let pattern = Some(*pattern);
+                                set(self, DeviceSetting::Leds { sensor: false, pattern });
+                            }
+                        }
+                    });
                 });
 
                 if !connected {
                     ui.add_space(4.0);
                     ui.weak("Settings apply once a device is open.");
                 }
+                });
             });
     }
 

@@ -65,8 +65,8 @@ pub mod time;
 pub mod usb;
 
 pub use device::{
-    Counters, CurrentRange, GpioVref, Js220, Rows, StreamConfig, VoltageRange, BASE_RATE,
-    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+    Counters, CurrentRange, GpiFilter, GpioVref, Js220, Rows, SignalFilter, StreamConfig,
+    VoltageRange, BASE_RATE, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
 };
 pub use error::{Error, Result};
 pub use gpi::{GpiBlock, GpiChannel, GpiCounters};

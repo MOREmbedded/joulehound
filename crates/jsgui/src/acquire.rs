@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use js220::device::Source;
 use js220::proto::stats::Statistics;
-use js220::{CurrentRange, GpioVref, Js220, Signal, StreamConfig, TransportConfig, VoltageRange};
+use js220::{
+    CurrentRange, GpiFilter, GpioVref, Js220, Signal, SignalFilter, StreamConfig, TransportConfig,
+    VoltageRange,
+};
 
 use crate::buffer::SignalTrace;
 use crate::raw::RawTrace;
@@ -114,6 +117,35 @@ pub enum DeviceSetting {
     TriggerOutput(bool),
     /// Reset the instrument's charge and energy accumulators.
     ClearAccumulators,
+    /// Filter used when the instrument halves its base rate.
+    SignalFilter(SignalFilter),
+    /// How the general purpose inputs are reduced, and by how much.
+    GpiFilter(GpiFilter, u32),
+    /// Which line carries the timesync pulse-per-second.
+    PpsInput(u8),
+    /// Make-before-break overlap when switching current ranges.
+    RangeOverlap(u8),
+    /// Compensation on the most sensitive current range.
+    RangeCompensation(bool),
+    /// Whether the ADC forwards a summary rather than samples.
+    AdcSummary(bool),
+    /// Drive the status LEDs, or hand them back to the instrument.
+    Leds {
+        /// The sensor's LED rather than the controller's.
+        sensor: bool,
+        /// Red, green and blue blink patterns, or None to release them.
+        pattern: Option<(u8, u8, u8)>,
+    },
+    /// Enable or disable one fuse.
+    FuseEnabled(u8, bool),
+    /// Raw accumulation and dissipation constants for one fuse.
+    FuseConstants(u8, u32, u32),
+    /// Clear one tripped fuse, or every one of them.
+    ClearFuse(Option<u8>),
+    /// Samples per on-instrument statistics block.
+    StatisticsBlock(u32),
+    /// Multipliers applied to current and voltage as they arrive.
+    Scales(f32, f32),
 }
 
 impl DeviceSetting {
@@ -128,6 +160,25 @@ impl DeviceSetting {
             Self::TriggerOutput(true) => "trigger line is an output".into(),
             Self::TriggerOutput(false) => "trigger line is an input".into(),
             Self::ClearAccumulators => "accumulators cleared".into(),
+            Self::SignalFilter(f) => format!("signal filter {f:?}"),
+            Self::GpiFilter(f, n) => format!("GPI filter {f:?} by {n}"),
+            Self::PpsInput(line) => format!("pulse-per-second on line {line}"),
+            Self::RangeOverlap(c) => format!("range overlap {c} cycles"),
+            Self::RangeCompensation(on) => format!("range compensation {on}"),
+            Self::AdcSummary(on) => format!("ADC summary {on}"),
+            Self::Leds { sensor, pattern } => {
+                let which = if sensor { "sensor" } else { "controller" };
+                match pattern {
+                    Some((r, g, b)) => format!("{which} LEDs {r}/{g}/{b}"),
+                    None => format!("{which} LEDs released"),
+                }
+            }
+            Self::FuseEnabled(n, on) => format!("fuse {n} enabled {on}"),
+            Self::FuseConstants(n, f, k) => format!("fuse {n} F={f} K={k}"),
+            Self::ClearFuse(Some(n)) => format!("fuse {n} cleared"),
+            Self::ClearFuse(None) => "every fuse cleared".into(),
+            Self::StatisticsBlock(n) => format!("statistics block {n} samples"),
+            Self::Scales(i, v) => format!("scales current x{i}, voltage x{v}"),
         }
     }
 }
@@ -586,6 +637,18 @@ fn handle_command(
                 DeviceSetting::Gpo(bits) => open.device.set_gpo(bits),
                 DeviceSetting::TriggerOutput(on) => open.device.set_trigger_output(on),
                 DeviceSetting::ClearAccumulators => open.device.clear_accumulators(),
+                DeviceSetting::SignalFilter(f) => open.device.set_signal_filter(f),
+                DeviceSetting::GpiFilter(f, n) => open.device.set_gpi_filter(f, n),
+                DeviceSetting::PpsInput(line) => open.device.set_pps_input(line),
+                DeviceSetting::RangeOverlap(c) => open.device.set_range_overlap(c),
+                DeviceSetting::RangeCompensation(on) => open.device.set_range_compensation(on),
+                DeviceSetting::AdcSummary(on) => open.device.set_adc_summary(on),
+                DeviceSetting::Leds { sensor, pattern } => open.device.set_leds(sensor, pattern),
+                DeviceSetting::FuseEnabled(n, on) => open.device.set_fuse_enabled(n, on),
+                DeviceSetting::FuseConstants(n, f, k) => open.device.set_fuse_constants(n, f, k),
+                DeviceSetting::ClearFuse(n) => open.device.clear_fuse(n),
+                DeviceSetting::StatisticsBlock(n) => open.device.set_statistics_block(n),
+                DeviceSetting::Scales(i, v) => open.device.set_scales(i, v),
             };
             let powered = open.device.target_power();
             let mut s = shared.lock().expect("shared snapshot poisoned");

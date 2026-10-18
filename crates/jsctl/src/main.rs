@@ -55,6 +55,8 @@ enum Command {
     Bench(BenchArgs),
     /// Read the general purpose inputs, and drive the outputs.
     Gpio(GpioArgs),
+    /// Publish one value to one of the instrument's topics.
+    Set(SetArgs),
 }
 
 #[derive(Args, Clone)]
@@ -382,6 +384,68 @@ struct GpioArgs {
     reads: u32,
 }
 
+#[derive(Args)]
+struct SetArgs {
+    #[command(flatten)]
+    device: DeviceArgs,
+
+    /// Topic to publish to, as `jsctl topics` lists it.
+    topic: String,
+
+    /// Value to publish.
+    value: u32,
+
+    /// Width the instrument expects. Its metadata names this per topic.
+    #[arg(long, value_enum, default_value_t = WidthArg::U8)]
+    width: WidthArg,
+
+    /// Print the topic tree afterwards so the result can be seen.
+    #[arg(long)]
+    verify: bool,
+}
+
+/// Widths the instrument's settable topics use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum WidthArg {
+    /// Eight bits, which most settings and every boolean use.
+    U8,
+    /// Thirty-two bits.
+    U32,
+}
+
+fn cmd_set(args: &SetArgs) -> Result<()> {
+    let mut dev = args.device.open()?;
+    let value = match args.width {
+        WidthArg::U8 => {
+            let narrowed = u8::try_from(args.value)
+                .with_context(|| format!("{} does not fit in u8", args.value))?;
+            js220::proto::value::Value::U8(narrowed)
+        }
+        WidthArg::U32 => js220::proto::value::Value::U32(args.value),
+    };
+    dev.publish(&args.topic, value)
+        .with_context(|| format!("publishing to {}", args.topic))?;
+    // Without this the publish can be dropped and the command would report
+    // success having changed nothing.
+    dev.barrier().context("confirming the publish")?;
+    println!("published {} = {}", args.topic, args.value);
+
+    if args.verify {
+        dev.request_metadata().context("requesting metadata")?;
+        drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(8))?;
+        dev.request_values().context("requesting values")?;
+        drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(6))?;
+        // The instrument holds its last reply until it next receives a
+        // frame, so without this the value read back is a step out of date.
+        dev.barrier().context("flushing the reply")?;
+        match dev.params().get(&format!("{}?", args.topic)) {
+            Some(v) => println!("device reports  {v:?}"),
+            None => println!("device did not report that topic back"),
+        }
+    }
+    Ok(())
+}
+
 fn cmd_gpio(args: &GpioArgs) -> Result<()> {
     let mut dev = args.device.open()?;
     dev.publish(
@@ -467,6 +531,7 @@ fn main() -> Result<()> {
         Command::Capture(args) => cmd_capture(&args),
         Command::Bench(args) => cmd_bench(&args),
         Command::Gpio(args) => cmd_gpio(&args),
+        Command::Set(args) => cmd_set(&args),
     }
 }
 
