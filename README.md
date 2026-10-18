@@ -1,9 +1,11 @@
-# joulehound
+# railprobe
 
 A Rust host driver, command line tool and live GUI for the
 [Joulescope JS220](https://www.joulescope.com/) precision energy analyzer.
 
-It chases down where the joules went.
+For the measurement embedded work actually needs: what a rail is drawing,
+right now, down to microamps and up to amps, with the logic lines that explain
+why.
 
 The official stack is a C driver (`joulescope_driver`) with Python bindings and
 a Qt UI. This is an independent implementation of the same USB protocol in
