@@ -18,6 +18,22 @@ mod fmt;
 mod peaks;
 mod raw;
 
+/// Decode the window icon, or go without one.
+///
+/// A missing icon is a cosmetic loss and never a reason to refuse to start,
+/// so every failure here is swallowed.
+fn window_icon() -> Option<std::sync::Arc<eframe::egui::IconData>> {
+    // The 256 px source of the same mark compiled into the executable.
+    let png = include_bytes!("../assets/icon.png");
+    let decoded = image::load_from_memory(png).ok()?.into_rgba8();
+    let (width, height) = decoded.dimensions();
+    Some(std::sync::Arc::new(eframe::egui::IconData {
+        rgba: decoded.into_raw(),
+        width,
+        height,
+    }))
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,js220=info"))
         .init();
@@ -46,11 +62,18 @@ fn main() -> eframe::Result<()> {
         Some((parts.next()?, parts.next()?))
     });
 
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("Joulescope JS220");
+    // The icon embedded in the executable covers the file and the shortcut;
+    // this is the one the window and the taskbar show.
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("Joulescope JS220"),
+        viewport,
         ..Default::default()
     };
 

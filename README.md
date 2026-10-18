@@ -37,8 +37,9 @@ instrument's own settings. [What has and has not been
 verified](#verification) is set out below, including the things this cannot
 confirm without hardware it does not have.
 
-Not released anywhere yet: no crates.io publication, no tagged version, no CI.
-Linux and macOS are untested — see [platform notes](#platform-notes).
+Not released anywhere yet: no crates.io publication and no tagged version.
+Linux and macOS are untested — see [platform notes](#platform-notes). What is
+not built is in [ROADMAP.md](ROADMAP.md).
 
 ## Build
 

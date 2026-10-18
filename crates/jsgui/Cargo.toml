@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+build = "build.rs"
+
 [[bin]]
 name = "jsgui"
 path = "src/main.rs"
@@ -24,6 +26,12 @@ rust_xlsxwriter = "0.100"
 # Native save dialog; picking a file by typing a path into a text box is not
 # what anyone expects from a desktop application.
 rfd = "0.17"
+# Decodes the window icon. Already in the tree by way of eframe.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the icon and version strings into the .exe.
+winresource = "0.1"
 
 [dev-dependencies]
 # Reads the workbook back in the tests without trusting the writer that made
