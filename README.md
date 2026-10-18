@@ -254,7 +254,8 @@ round-tripping through real files.
 | Capture, 1 Msps binary | 2,999,808 rows in 3.001 s — exactly 1 Msps, 34.33 MiB |
 | Capture, 1 ksps CSV | 1,999 rows in 2.001 s, sample ids advancing by 2000 |
 | GPI, all five lines | **2.00 Msps each**, 0 filled, 0 discontinuities, at 8.72 MiB/s |
-| GUI with three logic lines | 1.01 M samples/s at 8.53 MiB/s, logic rows tracking the shared axis |
+| GUI, three logic lines | 1.01 M samples/s at 8.53 MiB/s |
+| GUI, all five logic lines | 1.08 M samples/s at 9.73 MiB/s, 2 min 47 s unbroken, no frame errors, ~1.15 cores |
 
 GPI **levels** are not verified. Nothing is connected to the input pins here,
 so every line reads low under both Vref settings and no edge has ever been
