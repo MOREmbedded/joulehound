@@ -774,8 +774,22 @@ impl Js220 {
             // range engaged the reading is meaningless either way.
             self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_OFF))?;
         }
+        // A publish with nothing behind it can be dropped, which here means a
+        // switch that reports success and does nothing.
+        self.sync_output()?;
         self.target_power = on;
         Ok(())
+    }
+
+    /// Round-trip a port 0 echo, confirming the output path and flushing
+    /// whatever the instrument is holding on the way back.
+    ///
+    /// Callers that publish directly with [`Js220::publish`] need this: a
+    /// publish with nothing behind it can be dropped, and the instrument
+    /// holds its own replies until it next receives a frame, so a value
+    /// queried without one comes back a step out of date.
+    pub fn barrier(&mut self) -> Result<()> {
+        self.sync_output()
     }
 
     /// Whether the current path to the target is closed.

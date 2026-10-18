@@ -252,6 +252,11 @@ struct PowerArgs {
     #[arg(value_enum)]
     state: PowerState,
 
+    /// Toggle the setting this many extra times, reporting what the
+    /// instrument says its range mode is after each one.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    toggles: u32,
+
     /// Hold the setting for this many seconds before exiting.
     ///
     /// The instrument reverts when the host disconnects, so a bare switch
@@ -507,6 +512,34 @@ fn cmd_power(args: &PowerArgs) -> Result<()> {
             "reading {} with the path open, which measures nothing;
 check the target itself to confirm it lost power",
             fmt::si(sum / count as f64, "A")
+        );
+    }
+    for n in 1..=args.toggles {
+        let want = if n % 2 == 1 { !on } else { on };
+        dev.set_target_power(want)
+            .context("switching target power")?;
+        // The instrument does not announce a changed setting, so its own
+        // view has to be asked for.
+        dev.request_values().context("requesting values")?;
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            dev.poll(POLL_TIMEOUT)?;
+            let rows = dev.rows();
+            let used = rows.len;
+            dev.consume(used);
+        }
+        // The instrument holds its reply until it next receives a frame, so
+        // without this the value read back is a step out of date.
+        dev.barrier().context("flushing the reply")?;
+        let reported = dev
+            .params()
+            .get("s/i/range/mode?")
+            .and_then(|v| v.as_i64())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "not reported".into());
+        println!(
+            "toggle {n}           asked {:3}, device says mode {reported}",
+            if want { "on" } else { "off" }
         );
     }
     eprintln!(

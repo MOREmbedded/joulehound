@@ -38,6 +38,12 @@ fn main() -> eframe::Result<()> {
             .collect::<Vec<u8>>()
     });
     let vref_3v3 = value("--gpio-vref").is_some_and(|v| v == "3v3");
+    // Two times in seconds, for reproducing a measurement without hunting
+    // for the same span by hand.
+    let markers = value("--markers").and_then(|v| {
+        let mut parts = v.split(',').filter_map(|p| p.trim().parse::<f64>().ok());
+        Some((parts.next()?, parts.next()?))
+    });
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -56,6 +62,7 @@ fn main() -> eframe::Result<()> {
                 autostart,
                 gpi.clone(),
                 vref_3v3,
+                markers,
             )))
         }),
     )

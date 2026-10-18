@@ -235,6 +235,7 @@ impl App {
         autostart: bool,
         gpi: Option<Vec<u8>>,
         vref_3v3: bool,
+        markers: Option<(f64, f64)>,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut app = Self {
@@ -251,8 +252,8 @@ impl App {
             visible: [true; VIEWS.len()],
             window_seconds: None,
             view_x: None,
-            marker_a: None,
-            marker_b: None,
+            marker_a: markers.map(|(a, _)| a),
+            marker_b: markers.map(|(_, b)| b),
             dragging: None,
             drag_last_x: 0.0,
             buckets: Vec::new(),
@@ -501,6 +502,17 @@ impl App {
     }
 }
 
+/// The measurements reported for a marker span, in the order shown.
+#[allow(clippy::type_complexity)]
+const FIELDS: &[(&str, fn(&RangeStats) -> f64)] = &[
+    ("avg", |s| s.mean as f64),
+    ("std", |s| s.std as f64),
+    ("rms", |s| s.rms as f64),
+    ("min", |s| s.min as f64),
+    ("max", |s| s.max as f64),
+    ("p2p", |s| s.p2p() as f64),
+];
+
 /// Where a marker goes when no particular time was named.
 ///
 /// The pointer wins when it is over the drawn range. It is deliberately not
@@ -547,6 +559,7 @@ impl eframe::App for App {
 
         self.toolbar(ctx, &shared);
         self.status_bar(ctx, &shared);
+        self.marker_panel(ctx, &shared);
         if self.show_log {
             self.log_panel(ctx, &shared);
         }
@@ -869,6 +882,122 @@ impl App {
                 ui.toggle_value(&mut self.show_log, "Log");
             });
             ui.add_space(4.0);
+        });
+    }
+
+    /// Measurements across the marker span, as a table.
+    ///
+    /// The per-plot overlay says what one signal is doing; this says what
+    /// every signal is doing at once, which is the question a pair of markers
+    /// is usually asked. Shown only when there is a span to measure.
+    fn marker_panel(&mut self, ctx: &egui::Context, shared: &Shared) {
+        let Some((a, b)) = self.export_range(ExportSpan::Markers) else {
+            return;
+        };
+        let dt = b - a;
+        let views = views_for(shared.source, (0, 1));
+        let coarse = [&shared.current, &shared.voltage, &shared.power];
+        let raw = [&shared.raw_current, &shared.raw_voltage, &shared.raw_power];
+
+        // Gathered first so the table is laid out from what actually exists.
+        let mut columns: Vec<(&SignalView, RangeStats)> = Vec::new();
+        for (i, view) in views.iter().enumerate() {
+            if !self.visible[i] {
+                continue;
+            }
+            if let Some(stats) = span_stats(raw[i], coarse[i], a, b) {
+                columns.push((view, stats));
+            }
+        }
+
+        egui::TopBottomPanel::bottom("marker_stats").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.colored_label(MARKER_A, "A");
+                ui.weak(fmt::clock(a));
+                ui.colored_label(MARKER_B, "B");
+                ui.weak(fmt::clock(b));
+                ui.separator();
+                ui.strong(format!("Δt {}", fmt::si(dt, "s")));
+                if dt > 0.0 {
+                    // The rate a repeating feature would have, which is what
+                    // the span is measuring whenever it brackets one period.
+                    ui.label(format!("1/Δt {}", fmt::si(1.0 / dt, "Hz")));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Clear markers")
+                        .clicked()
+                    {
+                        self.marker_a = None;
+                        self.marker_b = None;
+                    }
+                });
+            });
+
+            if columns.is_empty() {
+                ui.weak("No samples in that span");
+                ui.add_space(2.0);
+                return;
+            }
+
+            egui::Grid::new("marker_stats_grid")
+                .striped(true)
+                .num_columns(columns.len() + 1)
+                .show(ui, |ui| {
+                    ui.label("");
+                    for (view, _) in &columns {
+                        ui.colored_label(view.colour, egui::RichText::new(view.name).strong());
+                    }
+                    ui.end_row();
+
+                    for (name, pick) in FIELDS {
+                        ui.weak(*name);
+                        for (view, stats) in &columns {
+                            ui.label(fmt::si(pick(stats), view.unit));
+                        }
+                        ui.end_row();
+                    }
+
+                    // Charge and energy, where the integral means something.
+                    // Voltage gets a dash rather than a number nobody asked
+                    // for.
+                    ui.weak("∫");
+                    for (view, stats) in &columns {
+                        match view.integral_unit {
+                            Some(unit) => {
+                                ui.label(fmt::si(stats.mean as f64 * dt, unit));
+                            }
+                            None => {
+                                ui.weak("—");
+                            }
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            // Logic lines summarised on one line: a level has no average
+            // worth printing, but how long it was high does.
+            let logic: Vec<String> = shared
+                .gpi
+                .iter()
+                .filter(|t| self.gpi_shown(t.channel))
+                .filter_map(|t| {
+                    let mut buckets = Vec::new();
+                    aggregate_for_view(&t.raw, &t.coarse, (a, b), 512, &mut buckets);
+                    logic_summary(&buckets, (a, b)).map(|s| format!("{}: {s}", gpi_name(t.channel)))
+                })
+                .collect();
+            if !logic.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for line in logic {
+                        ui.colored_label(LOGIC, line);
+                        ui.separator();
+                    }
+                });
+            }
+            ui.add_space(2.0);
         });
     }
 
@@ -1531,8 +1660,11 @@ fn plot_signal(
             }
         }
 
+        // With both markers down the panel below carries these numbers for
+        // every signal at once, so repeating them here would only cover the
+        // trace they describe.
         let (stats_span, label) = match markers {
-            (Some(a), Some(b)) => (Some((a, b)), format!("Δt {}", fmt::si((b - a).abs(), "s"))),
+            (Some(_), Some(_)) => (None, String::new()),
             (Some(a), None) => (Some((x.0, a)), "view → A".to_string()),
             _ => (Some((x.0, x.1)), "view".to_string()),
         };
@@ -2384,6 +2516,39 @@ mod tests {
                 mean: (min + max) / 2.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn every_reported_field_is_distinct_and_named() {
+        let names: Vec<&str> = FIELDS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["avg", "std", "rms", "min", "max", "p2p"]);
+        assert!(names.iter().all(|n| !n.is_empty()));
+    }
+
+    #[test]
+    fn the_reported_fields_read_the_values_they_name() {
+        let s = RangeStats {
+            mean: 2.0,
+            std: 0.5,
+            rms: 2.25,
+            min: 1.0,
+            max: 5.0,
+            buckets: 10,
+        };
+        let by = |want: &str| {
+            FIELDS
+                .iter()
+                .find(|(n, _)| *n == want)
+                .map(|(_, f)| f(&s))
+                .unwrap()
+        };
+        assert_eq!(by("avg"), 2.0);
+        assert_eq!(by("std"), 0.5);
+        assert_eq!(by("rms"), 2.25);
+        assert_eq!(by("min"), 1.0);
+        assert_eq!(by("max"), 5.0);
+        // Peak to peak is the span, not either end of it.
+        assert_eq!(by("p2p"), 4.0);
     }
 
     #[test]

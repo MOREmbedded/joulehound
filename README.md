@@ -161,6 +161,14 @@ reference you drive on the Vref pin; with nothing connected there the inputs
 read a fixed level and no edge ever appears. **3.3 V** has the instrument
 supply the reference itself.
 
+**Marker measurements.** With a pair down, a panel under the plots reports
+Δt and 1/Δt and, per signal, avg, std, rms, min, max, p2p and the time
+integral where one is meaningful — so charge and energy are read off the same
+span, and voltage gets a dash rather than a number nobody asked for. Logic
+lines report their edges and duty cycle over the same span. The per-plot
+overlay steps aside while the panel is up rather than repeating it over the
+trace it describes.
+
 **Stop does not disturb the target.** Stopping closes the instrument's data
 ports but keeps the device open, so the current path stays shut and whatever
 is being measured keeps running. Starting again takes about 0.35 s. `⏏`
@@ -262,6 +270,7 @@ round-tripping through real files.
 | Capture, 1 ksps CSV | 1,999 rows in 2.001 s, sample ids advancing by 2000 |
 | GPI, all five lines | **2.00 Msps each**, 0 filled, 0 discontinuities, at 8.72 MiB/s |
 | GUI, three logic lines | 1.01 M samples/s at 8.53 MiB/s |
+| Target power switch | **10 of 10 toggles**, device's own `s/i/range/mode` reading 0 and 4 exactly as asked |
 | Stream restart, device held open | **0.35 s**, target current continuous across it (was 1.29 s) |
 | GUI, all five logic lines | 1.08 M samples/s at 9.73 MiB/s, 2 min 47 s unbroken, no frame errors, ~1.15 cores |
 
