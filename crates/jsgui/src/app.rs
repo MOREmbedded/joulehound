@@ -14,7 +14,7 @@ use crate::export::{self, Column};
 use crate::fmt;
 use crate::peaks::{self, Edge};
 use crate::raw::RawTrace;
-use js220::device::Source;
+use js220::device::{GpioVref, Source};
 
 /// Sample rates offered in the toolbar. Every one divides 2 MHz exactly.
 const RATES: [u32; 8] = [
@@ -178,6 +178,17 @@ pub struct App {
     export_rows: usize,
     /// Result of the last export, shown in the status bar.
     export_status: Option<String>,
+    /// Which general purpose inputs to capture on the next start.
+    ///
+    /// Applied when streaming begins rather than live: the ports are enabled
+    /// as part of the stream configuration, and toggling one mid-capture
+    /// would leave a trace whose history covers a different set of lines
+    /// than its tail.
+    gpi_enabled: [bool; js220::proto::stream::GPI_CHANNELS.len()],
+    /// What the inputs compare against.
+    gpio_vref: GpioVref,
+    /// Height of each logic plot, which needs far less room than a waveform.
+    gpi_height: f32,
 }
 
 /// Which span an export covers.
@@ -208,8 +219,14 @@ enum Grab {
 impl App {
     /// Build the application and start the acquisition thread.
     ///
-    /// `autostart` begins streaming immediately if a device is present.
-    pub fn new(cc: &eframe::CreationContext<'_>, autostart: bool) -> Self {
+    /// `autostart` begins streaming immediately if a device is present, and
+    /// `gpi` pre-selects general purpose inputs to capture with it.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        autostart: bool,
+        gpi: Option<Vec<u8>>,
+        vref_3v3: bool,
+    ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut app = Self {
             acq: Acquisition::spawn(crate::acquire::BUCKETS),
@@ -240,17 +257,41 @@ impl App {
             // file that takes a minute to open.
             export_rows: 20_000,
             export_status: None,
+            gpi_enabled: gpi_selection(gpi.as_deref()),
+            gpio_vref: if vref_3v3 {
+                GpioVref::V3p3
+            } else {
+                GpioVref::External
+            },
+            gpi_height: 46.0,
         };
         app.rescan();
         if autostart && app.serial.is_some() {
-            app.acq.send(Command::Start {
-                serial: app.serial.clone(),
-                source: source_for(app.rate),
-                rate: app.rate,
-                statistics: app.statistics,
-            });
+            app.acq.send(app.start_command());
         }
         app
+    }
+
+    /// The general purpose input channels currently selected.
+    fn gpi_channels(&self) -> Vec<u8> {
+        js220::proto::stream::GPI_CHANNELS
+            .iter()
+            .zip(self.gpi_enabled)
+            .filter(|(_, on)| *on)
+            .map(|(c, _)| *c)
+            .collect()
+    }
+
+    /// The command that begins streaming with the current settings.
+    fn start_command(&self) -> Command {
+        Command::Start {
+            serial: self.serial.clone(),
+            source: source_for(self.rate),
+            rate: self.rate,
+            statistics: self.statistics,
+            gpi: self.gpi_channels(),
+            gpio_vref: self.gpio_vref,
+        }
     }
 
     fn rescan(&mut self) {
@@ -302,6 +343,19 @@ impl App {
             aggregate_for_view(raw[i], coarse[i], (lo, hi), self.export_rows, &mut buckets);
             data.push((view.name, view.unit, buckets));
         }
+        // Logic lines go in the same file, on the same time axis: lining an
+        // edge up against a current step is the whole reason to capture both.
+        for line in &shared.gpi {
+            let mut buckets = Vec::new();
+            aggregate_for_view(
+                &line.raw,
+                &line.coarse,
+                (lo, hi),
+                self.export_rows,
+                &mut buckets,
+            );
+            data.push((gpi_name(line.channel), "", buckets));
+        }
         if data.iter().all(|(_, _, b)| b.is_empty()) {
             self.export_status = Some("No samples in that span".to_string());
             return;
@@ -343,6 +397,20 @@ impl App {
         self.marker_a = Some(lo + span * 0.35);
         self.marker_b = Some(lo + span * 0.65);
     }
+}
+
+/// Turn a list of channel numbers into the per-channel selection flags.
+///
+/// Numbers the instrument does not have are ignored rather than rejected:
+/// this comes from a command line, and refusing to start over a typo in an
+/// optional switch would be worse than not capturing that line.
+fn gpi_selection(channels: Option<&[u8]>) -> [bool; js220::proto::stream::GPI_CHANNELS.len()] {
+    let mut out = [false; js220::proto::stream::GPI_CHANNELS.len()];
+    let Some(channels) = channels else { return out };
+    for (i, c) in js220::proto::stream::GPI_CHANNELS.iter().enumerate() {
+        out[i] = channels.contains(c);
+    }
+    out
 }
 
 fn default_record_path() -> String {
@@ -413,12 +481,7 @@ impl App {
                     .add_enabled(self.serial.is_some(), egui::Button::new("▶ Start"))
                     .clicked()
                 {
-                    self.acq.send(Command::Start {
-                        serial: self.serial.clone(),
-                        source: source_for(self.rate),
-                        rate: self.rate,
-                        statistics: self.statistics,
-                    });
+                    self.acq.send(self.start_command());
                 }
 
                 ui.separator();
@@ -532,6 +595,42 @@ impl App {
                     .clicked()
                 {
                     self.acq.send(Command::ClearTraces);
+                }
+
+                ui.separator();
+                // Enabled as part of the stream configuration, so the choice
+                // is locked while a capture is running.
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.menu_button("Logic", |ui| {
+                        ui.label("Capture these inputs:");
+                        for (i, channel) in js220::proto::stream::GPI_CHANNELS.iter().enumerate() {
+                            let label = if *channel == 7 {
+                                "IN 7 (trigger)".to_string()
+                            } else {
+                                format!("IN {channel}")
+                            };
+                            ui.checkbox(&mut self.gpi_enabled[i], label);
+                        }
+                        ui.separator();
+                        ui.label("Compare against:");
+                        ui.radio_value(&mut self.gpio_vref, GpioVref::External, "External Vref")
+                            .on_hover_text(
+                                "Senses against the reference you drive on the Vref                                  pin. With nothing connected there the inputs read a                                  fixed level and no edge ever appears.",
+                            );
+                        ui.radio_value(&mut self.gpio_vref, GpioVref::V3p3, "3.3 V")
+                            .on_hover_text("The instrument supplies the reference itself");
+                        ui.separator();
+                        ui.weak("Applied when streaming starts");
+                    });
+                });
+                if !self.gpi_channels().is_empty() {
+                    ui.add(
+                        egui::DragValue::new(&mut self.gpi_height)
+                            .range(24.0..=160.0)
+                            .speed(1.0)
+                            .suffix(" px"),
+                    )
+                    .on_hover_text("Height of each logic plot");
                 }
 
                 ui.separator();
@@ -729,7 +828,12 @@ impl App {
                 return;
             }
             const HEADER: f32 = 26.0;
-            let height = (ui.available_height() / shown.len() as f32) - HEADER;
+            // Logic rows take a fixed slice off the top of the budget; the
+            // waveforms divide what is left. Dividing everything between the
+            // waveforms first would push the logic rows off the bottom.
+            let logic = shared.gpi.len() as f32 * (self.gpi_height + 4.0);
+            let available = (ui.available_height() - logic).max(120.0);
+            let height = (available / shown.len() as f32) - HEADER;
             let columns = (ui.available_width() as usize).clamp(64, 4096);
 
             let coarse = [&shared.current, &shared.voltage, &shared.power];
@@ -836,6 +940,43 @@ impl App {
                         Grab::Marker(Marker::B) => {
                             self.marker_b = self.marker_b.map(|v| v + dx);
                         }
+                        Grab::Span => {
+                            self.marker_a = self.marker_a.map(|v| v + dx);
+                            self.marker_b = self.marker_b.map(|v| v + dx);
+                        }
+                    }
+                }
+            }
+
+            // Logic lines last, under the waveforms they explain, sharing
+            // the same time axis and the same markers.
+            for i in 0..shared.gpi.len() {
+                let line = &shared.gpi[i];
+                aggregate_for_view(&line.raw, &line.coarse, x_range, columns, &mut self.buckets);
+                let outcome = plot_logic(
+                    ui,
+                    line.channel,
+                    &self.buckets,
+                    &line.raw,
+                    self.gpi_height,
+                    x_range,
+                    (self.marker_a, self.marker_b),
+                    self.dragging,
+                );
+                if let Some(x) = outcome.new_x {
+                    self.follow = [false; VIEWS.len()];
+                    self.view_x = Some(x);
+                }
+                if let Some((grab, t)) = outcome.press {
+                    self.dragging = grab;
+                    self.drag_last_x = t;
+                }
+                if let (Some(grab), Some(t)) = (self.dragging, outcome.drag_x) {
+                    let dx = t - self.drag_last_x;
+                    self.drag_last_x = t;
+                    match grab {
+                        Grab::Marker(Marker::A) => self.marker_a = self.marker_a.map(|v| v + dx),
+                        Grab::Marker(Marker::B) => self.marker_b = self.marker_b.map(|v| v + dx),
                         Grab::Span => {
                             self.marker_a = self.marker_a.map(|v| v + dx);
                             self.marker_b = self.marker_b.map(|v| v + dx);
@@ -1221,6 +1362,192 @@ fn plot_signal(
     });
 
     interact(ui, &response, x, y, markers, dragging)
+}
+
+/// Colour of a logic trace.
+const LOGIC: egui::Color32 = egui::Color32::from_rgb(140, 230, 170);
+
+/// Y range a logic plot draws in, leaving room above and below the two levels.
+const LOGIC_Y: (f64, f64) = (-0.2, 1.2);
+
+/// Draw one general purpose input as a logic trace.
+///
+/// Rendered from the bucket minimum and maximum rather than the mean: where a
+/// bucket covers an edge the two differ, and walking between them draws the
+/// transition as a vertical at the right instant. Drawing the mean would turn
+/// a 50% duty cycle into a flat line at half height, which is a waveform the
+/// input never had.
+#[allow(clippy::too_many_arguments)]
+fn plot_logic(
+    ui: &mut egui::Ui,
+    channel: u8,
+    buckets: &[Bucket],
+    raw: &RawTrace,
+    height: f32,
+    x: (f64, f64),
+    markers: (Option<f64>, Option<f64>),
+    dragging: Option<Grab>,
+) -> PlotOutcome {
+    let name = gpi_name(channel);
+    let plot = Plot::new(format!("gpi{channel}"))
+        .height(height.max(24.0))
+        .show_axes([false, false])
+        .show_grid([true, false])
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .allow_drag(false)
+        .allow_boxed_zoom(false)
+        .auto_bounds(egui::Vec2b::FALSE)
+        .label_formatter(move |_, value| {
+            format!(
+                "{name}
+{}
+{}",
+                fmt::clock(value.x),
+                logic_level(value.y)
+            )
+        });
+
+    let response = plot.show(ui, |plot_ui| {
+        plot_ui.set_plot_bounds(PlotBounds::from_min_max([x.0, LOGIC_Y.0], [x.1, LOGIC_Y.1]));
+        let bounds = plot_ui.plot_bounds();
+
+        if let (Some(a), Some(b)) = markers {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            plot_ui.polygon(
+                Polygon::new(PlotPoints::from(vec![
+                    [lo, bounds.min()[1]],
+                    [hi, bounds.min()[1]],
+                    [hi, bounds.max()[1]],
+                    [lo, bounds.max()[1]],
+                ]))
+                .name("A…B")
+                .fill_color(egui::Color32::from_rgba_unmultiplied(80, 150, 90, 38))
+                .stroke(egui::Stroke::NONE),
+            );
+        }
+
+        if !buckets.is_empty() {
+            let mut upper: Vec<[f64; 2]> = Vec::with_capacity(buckets.len());
+            let mut lower: Vec<[f64; 2]> = Vec::with_capacity(buckets.len());
+            for b in buckets {
+                if b.is_empty() {
+                    continue;
+                }
+                upper.push([b.t, b.max as f64]);
+                lower.push([b.t, b.min as f64]);
+            }
+            if !upper.is_empty() {
+                plot_ui.line(
+                    Line::new(PlotPoints::from(envelope_zigzag(&upper, &lower)))
+                        .name(name)
+                        .color(LOGIC)
+                        .width(1.4_f32),
+                );
+            }
+        }
+
+        for (t, label, colour) in [(markers.0, "A", MARKER_A), (markers.1, "B", MARKER_B)] {
+            let Some(t) = t else { continue };
+            plot_ui.vline(VLine::new(t).name(label).color(colour).width(1.4_f32));
+            // The level under the marker, read from the samples rather than
+            // the drawn buckets, so it stays exact when zoomed out.
+            if let Some(v) = raw.value_at(t) {
+                plot_ui.text(
+                    Text::new(
+                        PlotPoint::new(t, bounds.min()[1]),
+                        format!("{label} {}", logic_level(v as f64)),
+                    )
+                    .anchor(egui::Align2::LEFT_BOTTOM)
+                    .color(colour),
+                );
+            }
+        }
+
+        // The line's name and what it is doing, inside the plot because the
+        // axes are hidden to keep these rows short.
+        let span = match markers {
+            (Some(a), Some(b)) => (a.min(b), a.max(b)),
+            (Some(a), None) => (x.0, a),
+            _ => x,
+        };
+        let summary = match logic_summary(buckets, span) {
+            Some(s) => format!("{name}  {s}"),
+            None => name.to_string(),
+        };
+        plot_ui.text(
+            Text::new(
+                PlotPoint::new(
+                    bounds.min()[0] + (bounds.max()[0] - bounds.min()[0]) * 0.004,
+                    bounds.max()[1],
+                ),
+                summary,
+            )
+            .anchor(egui::Align2::LEFT_TOP)
+            .color(LOGIC),
+        );
+    });
+
+    // The Y range is fixed, so a Y gesture has nothing to act on; the X half
+    // behaves exactly as it does on a waveform, which is what keeps the axis
+    // and the markers shared.
+    let mut outcome = interact(ui, &response, x, LOGIC_Y, markers, dragging);
+    outcome.new_y = None;
+    outcome
+}
+
+/// Display name for a general purpose input.
+fn gpi_name(channel: u8) -> &'static str {
+    match channel {
+        0 => "IN 0",
+        1 => "IN 1",
+        2 => "IN 2",
+        3 => "IN 3",
+        _ => "IN 7",
+    }
+}
+
+/// Describe a logic level for the hover readout.
+fn logic_level(y: f64) -> &'static str {
+    if y >= 0.5 {
+        "high"
+    } else {
+        "low"
+    }
+}
+
+/// Summarize a logic trace over `span`: edges seen and time spent high.
+///
+/// Counted from the buckets on screen, so it describes what is drawn. A
+/// bucket whose minimum and maximum differ held both levels, and counts as at
+/// least one edge.
+fn logic_summary(buckets: &[Bucket], span: (f64, f64)) -> Option<String> {
+    let mut edges = 0usize;
+    let mut high = 0usize;
+    let mut total = 0usize;
+    let mut previous: Option<f32> = None;
+    for b in buckets {
+        if b.is_empty() || b.t < span.0 || b.t > span.1 {
+            continue;
+        }
+        total += 1;
+        if b.mean >= 0.5 {
+            high += 1;
+        }
+        // A bucket holding both levels covered an edge; so did one whose
+        // level differs from the bucket before it.
+        let within = b.min != b.max;
+        let between = previous.is_some_and(|p| p != b.max);
+        if within || between {
+            edges += 1;
+        }
+        previous = Some(b.max);
+    }
+    if total == 0 {
+        return None;
+    }
+    let duty = high as f64 / total as f64 * 100.0;
+    Some(format!("{edges} edge(s) · {duty:.0}% high"))
 }
 
 /// Apply the pan, zoom and marker gestures to the ranges this code owns.
@@ -1839,6 +2166,131 @@ mod tests {
             export_range(ExportSpan::Markers, None, (Some(4.0), Some(4.0))),
             None
         );
+    }
+
+    fn logic(values: &[(f32, f32)]) -> Vec<Bucket> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, (min, max))| Bucket {
+                t: i as f64,
+                min: *min,
+                max: *max,
+                mean: (min + max) / 2.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_gpi_switch_selects_nothing() {
+        assert_eq!(gpi_selection(None), [false; 5]);
+        assert_eq!(gpi_selection(Some(&[])), [false; 5]);
+    }
+
+    #[test]
+    fn a_gpi_switch_selects_the_channels_it_names() {
+        // GPI_CHANNELS is [0, 1, 2, 3, 7].
+        assert_eq!(
+            gpi_selection(Some(&[0, 7])),
+            [true, false, false, false, true]
+        );
+    }
+
+    #[test]
+    fn a_channel_the_instrument_lacks_is_ignored_not_fatal() {
+        // From a command line a typo should cost that one line, not the run.
+        assert_eq!(
+            gpi_selection(Some(&[4, 5, 1])),
+            [false, true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn every_gpi_channel_has_a_display_name() {
+        for &c in &js220::proto::stream::GPI_CHANNELS {
+            assert!(!gpi_name(c).is_empty(), "channel {c}");
+        }
+        assert_eq!(
+            gpi_name(7),
+            "IN 7",
+            "the trigger input is named like the rest"
+        );
+    }
+
+    #[test]
+    fn a_logic_level_reads_from_the_midpoint() {
+        assert_eq!(logic_level(0.0), "low");
+        assert_eq!(logic_level(0.49), "low");
+        assert_eq!(logic_level(0.5), "high");
+        assert_eq!(logic_level(1.0), "high");
+    }
+
+    #[test]
+    fn a_logic_summary_of_nothing_is_nothing() {
+        assert!(logic_summary(&[], (0.0, 10.0)).is_none());
+        // Every bucket outside the span counts as nothing too.
+        let b = logic(&[(0.0, 0.0)]);
+        assert!(logic_summary(&b, (100.0, 200.0)).is_none());
+    }
+
+    #[test]
+    fn a_flat_low_line_reports_no_edges() {
+        let b = logic(&[(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        let s = logic_summary(&b, (0.0, 10.0)).unwrap();
+        assert!(s.contains("0 edge"), "got {s}");
+        assert!(s.contains("0% high"), "got {s}");
+    }
+
+    #[test]
+    fn a_flat_high_line_is_high_all_of_the_time() {
+        let b = logic(&[(1.0, 1.0), (1.0, 1.0)]);
+        let s = logic_summary(&b, (0.0, 10.0)).unwrap();
+        assert!(s.contains("100% high"), "got {s}");
+    }
+
+    #[test]
+    fn a_level_change_between_buckets_is_an_edge() {
+        let b = logic(&[(0.0, 0.0), (1.0, 1.0)]);
+        let s = logic_summary(&b, (0.0, 10.0)).unwrap();
+        assert!(s.contains("1 edge"), "got {s}");
+        assert!(s.contains("50% high"), "got {s}");
+    }
+
+    #[test]
+    fn a_bucket_holding_both_levels_covered_an_edge() {
+        // Zoomed out, a whole pulse can land inside one bucket. Counting only
+        // changes between buckets would report a toggling line as flat.
+        let b = logic(&[(0.0, 1.0)]);
+        let s = logic_summary(&b, (0.0, 10.0)).unwrap();
+        assert!(s.contains("1 edge"), "got {s}");
+    }
+
+    #[test]
+    fn the_summary_follows_the_marker_span_not_the_whole_trace() {
+        let b = logic(&[(0.0, 0.0), (1.0, 1.0), (1.0, 1.0), (0.0, 0.0)]);
+        // Buckets 1 and 2 only: both high, no edge between them.
+        let s = logic_summary(&b, (1.0, 2.0)).unwrap();
+        assert!(s.contains("100% high"), "got {s}");
+        assert!(s.contains("0 edge"), "got {s}");
+    }
+
+    #[test]
+    fn a_hole_in_a_logic_trace_is_not_counted_as_a_level() {
+        let mut b = logic(&[(0.0, 0.0), (0.0, 0.0)]);
+        b.push(Bucket {
+            t: 2.0,
+            min: f32::NAN,
+            max: f32::NAN,
+            mean: f32::NAN,
+        });
+        let s = logic_summary(&b, (0.0, 10.0)).unwrap();
+        assert!(s.contains("0 edge"), "a gap is not an edge: {s}");
+    }
+
+    #[test]
+    fn the_logic_y_range_leaves_room_around_both_levels() {
+        assert!(LOGIC_Y.0 < 0.0, "low must not sit on the frame");
+        assert!(LOGIC_Y.1 > 1.0, "high must not sit on the frame");
     }
 
     #[test]

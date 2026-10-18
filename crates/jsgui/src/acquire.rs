@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use js220::device::Source;
 use js220::proto::stats::Statistics;
-use js220::{Js220, Signal, StreamConfig, TransportConfig};
+use js220::{GpioVref, Js220, Signal, StreamConfig, TransportConfig};
 
 use crate::buffer::SignalTrace;
 use crate::raw::RawTrace;
@@ -43,6 +43,13 @@ pub const BUCKETS: usize = 256 * 1024;
 /// the 1 Msps ceiling or far longer at lower rates.
 pub const RAW_SAMPLES: usize = 4 << 20;
 
+/// Raw samples retained per GPI line.
+///
+/// A quarter of the analog depth, which at the 2 MHz the lines always run at
+/// is half a second of edge-accurate history for 4 MB a line. Allocated only
+/// for lines actually enabled, so an unused input costs nothing.
+pub const GPI_RAW_SAMPLES: usize = 1 << 20;
+
 /// Commands the GUI sends to the acquisition thread.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -56,6 +63,10 @@ pub enum Command {
         rate: u32,
         /// Enable the on-instrument statistics stream.
         statistics: bool,
+        /// General purpose input lines to capture alongside the signals.
+        gpi: Vec<u8>,
+        /// What those lines compare against.
+        gpio_vref: GpioVref,
     },
     /// Stop streaming and close the device.
     Stop,
@@ -102,6 +113,35 @@ impl Status {
     }
 }
 
+/// One captured general purpose input line, ready to plot.
+///
+/// Held in the same two representations as an analog signal — a coarse
+/// history and a raw ring — so a logic line pans and zooms exactly like the
+/// traces above it. Levels are stored as 0.0 and 1.0 so one set of
+/// aggregation code serves both.
+#[derive(Debug)]
+pub struct GpiTrace {
+    /// The instrument's number for this line: 0..=3, or 7 for the trigger.
+    pub channel: u8,
+    /// Aggregated history.
+    pub coarse: SignalTrace,
+    /// Recent samples, for zooming in on an edge.
+    pub raw: RawTrace,
+}
+
+impl GpiTrace {
+    fn new(channel: u8, buckets: usize) -> Self {
+        let mut raw = RawTrace::new(GPI_RAW_SAMPLES);
+        // GPI always runs at the base rate, whatever the analog path is doing.
+        raw.reconfigure(GPI_RAW_SAMPLES, 1.0 / js220::BASE_RATE as f64);
+        Self {
+            channel,
+            coarse: SignalTrace::new(buckets),
+            raw,
+        }
+    }
+}
+
 /// Everything the GUI reads to draw a frame.
 #[derive(Debug)]
 pub struct Shared {
@@ -123,6 +163,8 @@ pub struct Shared {
     pub raw_voltage: RawTrace,
     /// Recent raw power samples.
     pub raw_power: RawTrace,
+    /// Captured general purpose input lines, in the order requested.
+    pub gpi: Vec<GpiTrace>,
     /// Most recent on-instrument statistics.
     pub statistics: Option<Statistics>,
     /// Sustained bulk IN rate in bytes per second.
@@ -189,6 +231,7 @@ impl Shared {
             raw_current: RawTrace::new(RAW_SAMPLES),
             raw_voltage: RawTrace::new(RAW_SAMPLES),
             raw_power: RawTrace::new(RAW_SAMPLES),
+            gpi: Vec::new(),
             statistics: None,
             throughput: 0.0,
             sample_rate: 0.0,
@@ -225,6 +268,10 @@ impl Shared {
         self.raw_current.clear();
         self.raw_voltage.clear();
         self.raw_power.clear();
+        for line in &mut self.gpi {
+            line.coarse.clear();
+            line.raw.clear();
+        }
     }
 
     /// Point the raw traces at a new sample rate, discarding what they hold.
@@ -297,6 +344,12 @@ struct Session {
     sample_period: f64,
     /// Index of the next sample, counted from capture start.
     next_index: u64,
+    /// Device sample id of row 0, which is what puts GPI on the same time
+    /// axis as the analog traces. The instrument counts both at 2 MHz, so a
+    /// GPI sample id minus this one is its position in base samples.
+    id0: Option<u64>,
+    /// Scratch for converting GPI bits into plottable levels.
+    gpi_levels: Vec<f32>,
     started: Instant,
     last_stats: Instant,
     last_bytes: u64,
@@ -357,17 +410,23 @@ fn handle_command(
             source,
             rate,
             statistics,
+            gpi,
+            gpio_vref,
         } => {
             {
                 let mut s = shared.lock().expect("shared snapshot poisoned");
                 s.status = Status::Connecting;
                 s.push_log(LogLevel::Info, "opening device", started);
                 s.clear_traces();
+                // Rebuilt rather than cleared: a different set of lines was
+                // asked for, and a trace for a line nobody enabled would sit
+                // on screen for the rest of the session showing nothing.
+                s.gpi = gpi.iter().map(|c| GpiTrace::new(*c, BUCKETS)).collect();
                 s.samples = 0;
                 s.filled = 0;
                 s.elapsed = 0.0;
             }
-            match start_session(serial.as_deref(), source, rate, statistics) {
+            match start_session(serial.as_deref(), source, rate, statistics, &gpi, gpio_vref) {
                 Ok(new) => {
                     let mut s = shared.lock().expect("shared snapshot poisoned");
                     s.serial = Some(new.device.serial().to_owned());
@@ -512,6 +571,8 @@ fn start_session(
     source: Source,
     rate: u32,
     statistics: bool,
+    gpi: &[u8],
+    gpio_vref: GpioVref,
 ) -> js220::Result<Session> {
     let device = Js220::open_with(serial, TransportConfig::default())?;
     // Raw ADC runs at its own fixed rate; the selector only governs the
@@ -525,6 +586,8 @@ fn start_session(
         rate: effective,
         sample_period: 1.0 / effective as f64,
         next_index: 0,
+        id0: None,
+        gpi_levels: Vec::new(),
         started: Instant::now(),
         last_stats: Instant::now(),
         last_bytes: 0,
@@ -537,6 +600,8 @@ fn start_session(
         sample_rate: rate,
         statistics,
         statistics_rate: 2.0,
+        gpi: gpi.to_vec(),
+        gpio_vref,
         ..Default::default()
     };
     session.device.stream_start(cfg)?;
@@ -555,6 +620,11 @@ fn pump(session: &mut Session, shared: &Arc<Mutex<Shared>>, started: Instant) ->
         n = rows.len;
         if n > 0 {
             let first_index = session.next_index;
+            // Anchor the two time bases on the first batch: row 0 and the
+            // device sample id it carries are the same instant.
+            if session.id0.is_none() {
+                session.id0 = Some(rows.sample_id);
+            }
             let mut guard = shared.lock().expect("shared snapshot poisoned");
             // Both representations are fed: the coarse trace is the long
             // history, the raw ring is what makes zooming in show the real
@@ -589,6 +659,7 @@ fn pump(session: &mut Session, shared: &Arc<Mutex<Shared>>, started: Instant) ->
         }
     }
     session.device.consume(n);
+    drain_gpi(session, shared);
 
     if let Some(stats) = session.device.take_statistics() {
         shared.lock().expect("shared snapshot poisoned").statistics = Some(stats);
@@ -625,6 +696,48 @@ fn pump(session: &mut Session, shared: &Arc<Mutex<Shared>>, started: Instant) ->
         session.last_samples = real;
     }
     Ok(())
+}
+
+/// Move the GPI samples waiting on the device into the shared traces.
+///
+/// Always drained, even before the time bases are anchored, so the device's
+/// buffers cannot grow without bound while the analog path is still warming
+/// up. Until that anchor exists there is nowhere to put the samples, so they
+/// are discarded rather than placed at a guessed time.
+fn drain_gpi(session: &mut Session, shared: &Arc<Mutex<Shared>>) {
+    let blocks = session.device.take_gpi();
+    if blocks.is_empty() {
+        return;
+    }
+    let Some(id0) = session.id0 else {
+        return;
+    };
+
+    // GPI runs at the base rate on both acquisition paths.
+    let period = 1.0 / js220::BASE_RATE as f64;
+    let bucket_seconds = HISTORY_BUCKET_SECONDS.max(period);
+    let mut levels = std::mem::take(&mut session.gpi_levels);
+    let mut guard = shared.lock().expect("shared snapshot poisoned");
+
+    for (channel, blocks) in blocks {
+        let Some(trace) = guard.gpi.iter_mut().find(|t| t.channel == channel) else {
+            continue;
+        };
+        for block in blocks {
+            // Samples from before the anchor belong to a time the display
+            // does not cover.
+            let Some(offset) = block.first_id.checked_sub(id0) else {
+                continue;
+            };
+            levels.clear();
+            levels.extend(block.bits.iter().map(|b| *b as f32));
+            trace.coarse.extend(&levels, offset, period, bucket_seconds);
+            trace.raw.push(&levels, offset);
+        }
+        trace.coarse.finish(bucket_seconds);
+    }
+    drop(guard);
+    session.gpi_levels = levels;
 }
 
 fn write_rows(rec: &mut Recorder, rows: &js220::Rows<'_>, n: usize) {

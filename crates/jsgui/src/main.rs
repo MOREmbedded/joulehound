@@ -22,9 +22,22 @@ fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,js220=info"))
         .init();
 
-    // Deliberately not a full argument parser: the GUI has one switch, and a
-    // dependency for it would not earn its place.
-    let autostart = std::env::args().any(|a| a == "--start");
+    // Deliberately not a full argument parser: a handful of switches do not
+    // earn a dependency.
+    let args: Vec<String> = std::env::args().collect();
+    let autostart = args.iter().any(|a| a == "--start");
+    let value = |name: &str| -> Option<String> {
+        let i = args.iter().position(|a| a == name)?;
+        args.get(i + 1).cloned()
+    };
+    // Lets a capture that needs logic lines be started from a shortcut or a
+    // script, without walking the menus first.
+    let gpi = value("--gpi").map(|list| {
+        list.split(',')
+            .filter_map(|p| p.trim().parse::<u8>().ok())
+            .collect::<Vec<u8>>()
+    });
+    let vref_3v3 = value("--gpio-vref").is_some_and(|v| v == "3v3");
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -37,6 +50,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Joulescope JS220",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, autostart)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                autostart,
+                gpi.clone(),
+                vref_3v3,
+            )))
+        }),
     )
 }

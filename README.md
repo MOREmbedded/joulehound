@@ -53,6 +53,9 @@ jsctl capture -o run.f32 --rate 1000000 --signals i,v,p --duration 10
 # Same, as CSV
 jsctl capture -o run.csv --format csv --rate 1000 --duration 10
 
+# Capture logic lines alongside the signals
+jsctl bench --duration 5 --gpi 0,1,7 --gpio-vref 3v3
+
 # How fast does this host actually sustain?
 jsctl bench --duration 10
 ```
@@ -139,6 +142,23 @@ window it happened to be exported from. Every row carries the mean, minimum
 and maximum of its time slice, because exporting the mean alone would discard
 exactly the spike the envelope exists to show. Slices no signal reached are
 left out rather than written as `NaN`.
+
+**Logic lines.** *Logic* picks which of the instrument's general purpose
+inputs to capture — IN 0 through IN 3 and IN 7, the trigger input — and they
+appear as compact rows beneath the waveforms, sharing one time axis and the
+same markers, so an edge can be read against the current step it caused. Each
+row reports the edges and duty cycle over the marker span, and the markers
+show the level underneath them. They run at the full 2 MHz whatever rate the
+analog path is using, because the point of a logic line is where its edges
+fall; the ports are enabled as part of the stream configuration, so the
+selection applies when streaming starts. Pass `--gpi 0,1,7` to select them
+from the command line instead.
+
+*Compare against* decides what the inputs measure themselves against.
+**External Vref** is the instrument's own default and senses against the
+reference you drive on the Vref pin; with nothing connected there the inputs
+read a fixed level and no edge ever appears. **3.3 V** has the instrument
+supply the reference itself.
 
 **Recording** writes the same interleaved little-endian `f32` format `jsctl`
 produces, so the two are interchangeable.
@@ -233,6 +253,15 @@ round-tripping through real files.
 | Gap fill | ~126 NaN samples per run, all at stream startup |
 | Capture, 1 Msps binary | 2,999,808 rows in 3.001 s — exactly 1 Msps, 34.33 MiB |
 | Capture, 1 ksps CSV | 1,999 rows in 2.001 s, sample ids advancing by 2000 |
+| GPI, all five lines | **2.00 Msps each**, 0 filled, 0 discontinuities, at 8.72 MiB/s |
+| GUI with three logic lines | 1.01 M samples/s at 8.53 MiB/s, logic rows tracking the shared axis |
+
+GPI **levels** are not verified. Nothing is connected to the input pins here,
+so every line reads low under both Vref settings and no edge has ever been
+observed. The instrument exposes no output that could drive one, so this
+cannot be settled without physically connecting a signal. The decoding itself
+follows the instrument's own driver, which packs these ports eight samples to
+a byte, least significant bit first.
 
 ### Two defects that hardware found, and what they teach
 
@@ -243,6 +272,14 @@ discarded silently — the device would acknowledge every enable with success an
 stream nothing. `open` now round-trips a port 0 echo until it comes back, which
 is positive evidence that frames sent afterwards are acted on. This was the
 difference between failing five runs in six and passing every one.
+
+The same lesson had to be learned twice. `stream_start` publishes a burst of
+configuration and did not use that barrier, so the tail of the burst was lost:
+asking for five GPI lines reliably produced three or four, varying run to run,
+always dropping the ones published last. One echo round-trip after the burst
+fixed it — five of five, three runs in a row. The general form is that any
+sequence of publishes needs a barrier before the device is expected to act on
+the last of them.
 
 **Connecting does not leave the instrument in a usable state.** A session that
 configures only the topics it needs leaves everything else as the previous
@@ -273,8 +310,13 @@ hostage until enough replies accumulate to fill it.
   them stops the instrument emitting statistics after the first record, so
   `jsctl stats` runs with every data port off. The cause is not understood;
   the official tool does the same.
-- The `u4` and `u1` run-length decoders are implemented to spec but no firmware
-  emits those streams compressed, so they are covered by unit tests only.
+- GPI levels are unverified. The lines stream at exactly 2 Msps with no gaps,
+  but nothing is wired to the inputs here, so every line reads low and no edge
+  has been observed. The instrument has no output that could drive one.
+- The current-range stream is decoded but not plotted. It is the same packed
+  4-bit format as the GPI lines and would show which shunt is engaged at any
+  instant, which is worth having when a range change shows up as a step in the
+  current trace.
 
 ### A warning for anyone measuring this
 
