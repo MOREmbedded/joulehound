@@ -933,16 +933,14 @@ impl Js220 {
         self.group.reset();
         self.power.clear();
 
-        // The same barrier the start path needs, for the same reason. Without
-        // it the tail of this burst is lost and the device keeps streaming
-        // ports this session believes it closed; the next session then opens
-        // into a flood and its metadata request is never answered, which
-        // showed up as `jsctl topics` reporting nothing at all after any run
-        // that used the GPI lines.
-        if let Err(e) = self.sync_output() {
-            first_err.get_or_insert(e);
-        }
-
+        // Deliberately no output barrier here, unlike `stream_start`. One was
+        // tried: it cost about 1.5 s on every stop, because the instrument is
+        // slow to answer an echo straight after a heavy stream, and it was
+        // guarding against something never observed — no session has been
+        // seen to leave a port streaming. It is also redundant. If the tail
+        // of this burst were lost, the next `open` sets every data port's
+        // ctrl back to 0 as part of restoring the defaults, behind a barrier
+        // that is already there, before any stream is configured.
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
