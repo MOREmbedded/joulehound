@@ -41,7 +41,7 @@ Run `cargo tree` for the full transitive set.
 
 ## This project
 
-Copyright the railprobe contributors.
+Copyright the joulehound contributors.
 
 Licensed under either of
 
