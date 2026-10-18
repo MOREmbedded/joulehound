@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use js220::device::Source;
 use js220::proto::stats::Statistics;
-use js220::{GpioVref, Js220, Signal, StreamConfig, TransportConfig};
+use js220::{CurrentRange, GpioVref, Js220, Signal, StreamConfig, TransportConfig, VoltageRange};
 
 use crate::buffer::SignalTrace;
 use crate::raw::RawTrace;
@@ -72,6 +72,8 @@ pub enum Command {
     Stop,
     /// Release the device entirely.
     Disconnect,
+    /// Apply one instrument setting without restarting the capture.
+    Device(DeviceSetting),
     /// Change which general purpose inputs are captured, mid-capture.
     SetGpi {
         /// The lines to capture from now on.
@@ -93,6 +95,41 @@ pub enum Command {
     RecordStop,
     /// Shut the thread down.
     Quit,
+}
+
+/// A setting that can be changed on an open device at any time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeviceSetting {
+    /// Which current range to use, or none at all.
+    CurrentRange(CurrentRange),
+    /// Bounds autoranging may choose between, least and most sensitive.
+    RangeBounds(u8, u8),
+    /// Which voltage range to use.
+    VoltageRange(VoltageRange),
+    /// What the general purpose inputs compare against.
+    GpioVref(GpioVref),
+    /// Drive the general purpose outputs to this bitmap.
+    Gpo(u32),
+    /// Whether the trigger line is an output.
+    TriggerOutput(bool),
+    /// Reset the instrument's charge and energy accumulators.
+    ClearAccumulators,
+}
+
+impl DeviceSetting {
+    /// What to say in the log once it is applied.
+    fn describe(self) -> String {
+        match self {
+            Self::CurrentRange(r) => format!("current range {r:?}"),
+            Self::RangeBounds(a, b) => format!("autorange bounds {a}..={b}"),
+            Self::VoltageRange(r) => format!("voltage range {r:?}"),
+            Self::GpioVref(v) => format!("GPIO reference {v:?}"),
+            Self::Gpo(bits) => format!("outputs {bits:#06b}"),
+            Self::TriggerOutput(true) => "trigger line is an output".into(),
+            Self::TriggerOutput(false) => "trigger line is an input".into(),
+            Self::ClearAccumulators => "accumulators cleared".into(),
+        }
+    }
 }
 
 /// Connection state, as the GUI should display it.
@@ -534,6 +571,33 @@ fn handle_command(
             s.serial = None;
             s.versions = None;
             s.push_log(LogLevel::Info, "disconnected", started);
+        }
+        Command::Device(setting) => {
+            let Some(open) = session.as_mut() else {
+                let mut s = shared.lock().expect("shared snapshot poisoned");
+                s.push_log(LogLevel::Warn, "not connected; setting ignored", started);
+                return;
+            };
+            let result = match setting {
+                DeviceSetting::CurrentRange(r) => open.device.set_current_range(r),
+                DeviceSetting::RangeBounds(a, b) => open.device.set_range_bounds(a, b),
+                DeviceSetting::VoltageRange(r) => open.device.set_voltage_range(r),
+                DeviceSetting::GpioVref(v) => open.device.set_gpio_vref(v),
+                DeviceSetting::Gpo(bits) => open.device.set_gpo(bits),
+                DeviceSetting::TriggerOutput(on) => open.device.set_trigger_output(on),
+                DeviceSetting::ClearAccumulators => open.device.clear_accumulators(),
+            };
+            let powered = open.device.target_power();
+            let mut s = shared.lock().expect("shared snapshot poisoned");
+            match result {
+                Ok(()) => {
+                    // The range switch is also the power switch, so the
+                    // button that shows it has to follow.
+                    s.target_power = powered;
+                    s.push_log(LogLevel::Info, setting.describe(), started);
+                }
+                Err(e) => s.push_log(LogLevel::Error, format!("{e}"), started),
+            }
         }
         Command::SetGpi { channels } => {
             let Some(open) = session.as_mut() else {

@@ -8,13 +8,13 @@ use egui_plot::{
     Polygon, Text, VLine,
 };
 
-use crate::acquire::{Acquisition, Command, LogLevel, Shared, Status};
+use crate::acquire::{Acquisition, Command, DeviceSetting, LogLevel, Shared, Status};
 use crate::buffer::{Bucket, RangeStats, SignalTrace};
 use crate::export::{self, Column};
 use crate::fmt;
 use crate::peaks::{self, Edge};
 use crate::raw::RawTrace;
-use js220::device::{GpioVref, Source};
+use js220::device::{CurrentRange, GpioVref, Source, VoltageRange};
 
 /// Sample rates offered in the toolbar. Every one divides 2 MHz exactly.
 const RATES: [u32; 8] = [
@@ -198,7 +198,25 @@ pub struct App {
     hover_t: Option<f64>,
     /// Time the marker context menu was opened at.
     menu_t: Option<f64>,
+    /// Whether the device settings panel is open.
+    show_device: bool,
+    /// Current range the panel has selected.
+    current_range: CurrentRange,
+    /// Autorange bounds, as range indices: least then most sensitive.
+    range_bounds: (u8, u8),
+    /// Voltage range the panel has selected.
+    voltage_range: VoltageRange,
+    /// Outputs the panel is driving, as a bitmap over line numbers.
+    gpo: u32,
+    /// Whether the trigger line is driven rather than sensed.
+    trigger_output: bool,
 }
+
+/// The instrument's current ranges, least sensitive first.
+///
+/// Taken from the device's own metadata for `s/i/range/select`, which names
+/// them; the index is what the range topics take.
+const CURRENT_RANGES: [&str; 6] = ["10 A", "180 mA", "18 mA", "1.8 mA", "180 uA", "18 uA"];
 
 /// Which span an export covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +254,7 @@ impl App {
         gpi: Option<Vec<u8>>,
         vref_3v3: bool,
         markers: Option<(f64, f64)>,
+        device_panel: bool,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut app = Self {
@@ -277,6 +296,12 @@ impl App {
             gpi_height: 46.0,
             hover_t: None,
             menu_t: None,
+            show_device: device_panel,
+            current_range: CurrentRange::Auto,
+            range_bounds: (0, 5),
+            voltage_range: VoltageRange::Auto,
+            gpo: 0,
+            trigger_output: false,
         };
         app.rescan();
         if autostart && app.serial.is_some() {
@@ -624,6 +649,7 @@ impl eframe::App for App {
 
         self.toolbar(ctx, &shared);
         self.status_bar(ctx, &shared);
+        self.device_panel(ctx, &shared);
         if self.show_log {
             self.log_panel(ctx, &shared);
         }
@@ -951,10 +977,193 @@ impl App {
                     self.acq.send(Command::SetTargetPower { on: !on });
                 }
 
+                ui.toggle_value(&mut self.show_device, "Device")
+                    .on_hover_text("Ranges, GPIO reference, outputs and accumulators");
                 ui.toggle_value(&mut self.show_log, "Log");
             });
             ui.add_space(4.0);
         });
+    }
+
+    /// Instrument settings, the ones that are not about what is drawn.
+    ///
+    /// Every control here publishes immediately rather than waiting for a
+    /// restart, because these are questions about the measurement and the
+    /// answer is wanted while watching it.
+    fn device_panel(&mut self, ctx: &egui::Context, shared: &Shared) {
+        if !self.show_device {
+            return;
+        }
+        let connected = self.connected(shared);
+        let set = |app: &mut Self, setting: DeviceSetting| {
+            app.acq.send(Command::Device(setting));
+        };
+
+        egui::SidePanel::right("device")
+            .default_width(250.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.strong("Device");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✖").clicked() {
+                            self.show_device = false;
+                        }
+                    });
+                });
+                ui.weak(match &shared.serial {
+                    Some(s) => s.clone(),
+                    None => "not connected".to_string(),
+                });
+                if let Some(v) = &shared.versions {
+                    ui.weak(v);
+                }
+                ui.separator();
+
+                ui.add_enabled_ui(connected, |ui| {
+                    ui.label("Current range");
+                    let before = self.current_range;
+                    egui::ComboBox::from_id_salt("i_range")
+                        .width(150.0)
+                        .selected_text(match self.current_range {
+                            CurrentRange::Auto => "auto".to_string(),
+                            CurrentRange::Off => "off (target unpowered)".to_string(),
+                            CurrentRange::Manual(n) => {
+                                CURRENT_RANGES[n.min(5) as usize].to_string()
+                            }
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.current_range, CurrentRange::Auto, "auto");
+                            for (i, name) in CURRENT_RANGES.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.current_range,
+                                    CurrentRange::Manual(i as u8),
+                                    *name,
+                                );
+                            }
+                            ui.selectable_value(
+                                &mut self.current_range,
+                                CurrentRange::Off,
+                                "off (target unpowered)",
+                            );
+                        });
+                    if self.current_range != before {
+                        set(self, DeviceSetting::CurrentRange(self.current_range));
+                    }
+
+                    // Only autoranging chooses between ranges, so the bounds
+                    // mean nothing anywhere else.
+                    ui.add_enabled_ui(self.current_range == CurrentRange::Auto, |ui| {
+                        ui.label("Autorange between");
+                        let before = self.range_bounds;
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("r_least")
+                                .width(72.0)
+                                .selected_text(CURRENT_RANGES[self.range_bounds.0.min(5) as usize])
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in CURRENT_RANGES.iter().enumerate() {
+                                        ui.selectable_value(&mut self.range_bounds.0, i as u8, *name);
+                                    }
+                                });
+                            ui.label("…");
+                            egui::ComboBox::from_id_salt("r_most")
+                                .width(72.0)
+                                .selected_text(CURRENT_RANGES[self.range_bounds.1.min(5) as usize])
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in CURRENT_RANGES.iter().enumerate() {
+                                        ui.selectable_value(&mut self.range_bounds.1, i as u8, *name);
+                                    }
+                                });
+                        });
+                        if self.range_bounds != before {
+                            // Kept in order, since the instrument rejects a
+                            // pair the wrong way round.
+                            let (a, b) = self.range_bounds;
+                            let (a, b) = (a.min(b), a.max(b));
+                            self.range_bounds = (a, b);
+                            set(self, DeviceSetting::RangeBounds(a, b));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Narrowing these stops the instrument hunting across ranges it will never need, which is what leaves a step in the trace.",
+                    );
+
+                    ui.separator();
+                    ui.label("Voltage range");
+                    let before = self.voltage_range;
+                    egui::ComboBox::from_id_salt("v_range")
+                        .width(150.0)
+                        .selected_text(match self.voltage_range {
+                            VoltageRange::Auto => "auto",
+                            VoltageRange::V2 => "2 V",
+                            VoltageRange::V15 => "15 V",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.voltage_range, VoltageRange::Auto, "auto");
+                            ui.selectable_value(&mut self.voltage_range, VoltageRange::V2, "2 V");
+                            ui.selectable_value(&mut self.voltage_range, VoltageRange::V15, "15 V");
+                        });
+                    if self.voltage_range != before {
+                        set(self, DeviceSetting::VoltageRange(self.voltage_range));
+                    }
+
+                    ui.separator();
+                    ui.label("GPIO reference");
+                    let before = self.gpio_vref;
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.gpio_vref, GpioVref::External, "Vref pin");
+                        ui.radio_value(&mut self.gpio_vref, GpioVref::V3p3, "3.3 V");
+                    });
+                    if self.gpio_vref != before {
+                        set(self, DeviceSetting::GpioVref(self.gpio_vref));
+                    }
+
+                    ui.label("Outputs");
+                    let before = (self.gpo, self.trigger_output);
+                    ui.horizontal(|ui| {
+                        for line in [0u8, 1] {
+                            let mut on = self.gpo & (1 << line) != 0;
+                            if ui.toggle_value(&mut on, format!("OUT {line}")).changed() {
+                                let bit = 1u32 << line;
+                                self.gpo = if on { self.gpo | bit } else { self.gpo & !bit };
+                            }
+                        }
+                        let mut on = self.gpo & (1 << 7) != 0;
+                        if ui
+                            .add_enabled(self.trigger_output, egui::Button::new("T"))
+                            .on_hover_text("The trigger line, when it is an output")
+                            .clicked()
+                        {
+                            on = !on;
+                            let bit = 1u32 << 7;
+                            self.gpo = if on { self.gpo | bit } else { self.gpo & !bit };
+                        }
+                    });
+                    ui.checkbox(&mut self.trigger_output, "Trigger line drives")
+                        .on_hover_text("Otherwise it is sensed, and appears as IN 7");
+                    if (self.gpo, self.trigger_output) != before {
+                        if self.trigger_output != before.1 {
+                            set(self, DeviceSetting::TriggerOutput(self.trigger_output));
+                        }
+                        set(self, DeviceSetting::Gpo(self.gpo));
+                    }
+
+                    ui.separator();
+                    if ui
+                        .button("Clear accumulators")
+                        .on_hover_text("Reset the instrument's charge and energy totals")
+                        .clicked()
+                    {
+                        set(self, DeviceSetting::ClearAccumulators);
+                    }
+                });
+
+                if !connected {
+                    ui.add_space(4.0);
+                    ui.weak("Settings apply once a device is open.");
+                }
+            });
     }
 
     fn status_bar(&mut self, ctx: &egui::Context, shared: &Shared) {

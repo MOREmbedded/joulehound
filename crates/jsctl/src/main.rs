@@ -53,6 +53,8 @@ enum Command {
     Capture(CaptureArgs),
     /// Measure sustained streaming throughput without writing to disk.
     Bench(BenchArgs),
+    /// Read the general purpose inputs, and drive the outputs.
+    Gpio(GpioArgs),
 }
 
 #[derive(Args, Clone)]
@@ -339,6 +341,15 @@ struct BenchArgs {
     #[arg(short, long, default_value_t = 10.0, value_name = "SECONDS")]
     duration: f64,
 
+    /// Drive the general purpose outputs while measuring, toggling this
+    /// bitmap on and off every 200 ms.
+    ///
+    /// Bit 0 is output 0, bit 7 the trigger line. Combined with --gpi this
+    /// says whether an output reaches an input, which is the only way to see
+    /// an edge without wiring something up.
+    #[arg(long, value_name = "BITS")]
+    gpo_toggle: Option<u32>,
+
     /// After measuring, stop and restart the stream this many times.
     ///
     /// Reports how long each restart takes and what the target was drawing
@@ -346,6 +357,100 @@ struct BenchArgs {
     /// stays shut and the target keeps its supply.
     #[arg(long, default_value_t = 0, value_name = "N")]
     restarts: u32,
+}
+
+#[derive(Args)]
+struct GpioArgs {
+    #[command(flatten)]
+    device: DeviceArgs,
+
+    /// Drive the outputs to this bitmap: bit 0 is output 0, bit 7 the
+    /// trigger line. Left alone when not given.
+    #[arg(long, value_name = "BITS")]
+    set: Option<u32>,
+
+    /// Make the trigger line an output rather than an input.
+    #[arg(long)]
+    trigger_output: bool,
+
+    /// What the inputs compare against.
+    #[arg(long, value_enum, default_value_t = GpioVrefArg::External)]
+    gpio_vref: GpioVrefArg,
+
+    /// Read the inputs this many times, a tenth of a second apart.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    reads: u32,
+}
+
+fn cmd_gpio(args: &GpioArgs) -> Result<()> {
+    let mut dev = args.device.open()?;
+    dev.publish(
+        js220::proto::topics::C_GPIO_VREF,
+        js220::proto::value::Value::U8(match args.gpio_vref {
+            GpioVrefArg::External => 0,
+            GpioVrefArg::V3p3 => 1,
+        }),
+    )
+    .context("setting the GPIO reference")?;
+    if args.trigger_output {
+        dev.set_trigger_output(true)
+            .context("setting the trigger direction")?;
+    }
+    if let Some(bits) = args.set {
+        dev.set_gpo(bits).context("driving the outputs")?;
+        println!("outputs driven to {bits:#010b}");
+    }
+
+    if args.reads == 0 {
+        return Ok(());
+    }
+
+    // Levels are read by briefly streaming the lines. The instrument also
+    // offers s/gpi/+/!req, and acknowledges it, but the answer comes back
+    // only to a subscriber and this driver does not subscribe; streaming is
+    // the path that is known to work.
+    let cfg = StreamConfig {
+        signals: vec![Signal::Current, Signal::Voltage],
+        gpi: js220::proto::stream::GPI_CHANNELS.to_vec(),
+        gpio_vref: match args.gpio_vref {
+            GpioVrefArg::External => js220::GpioVref::External,
+            GpioVrefArg::V3p3 => js220::GpioVref::V3p3,
+        },
+        ..Default::default()
+    };
+    dev.stream_start(cfg).context("starting the lines")?;
+
+    for n in 1..=args.reads {
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut level: Vec<(u8, u8)> = Vec::new();
+        while Instant::now() < deadline {
+            dev.poll(POLL_TIMEOUT)?;
+            let rows = dev.rows();
+            let used = rows.len;
+            dev.consume(used);
+            for (channel, blocks) in dev.take_gpi() {
+                if let Some(last) = blocks.iter().rev().find_map(|b| b.bits.last()) {
+                    match level.iter_mut().find(|(c, _)| *c == channel) {
+                        Some((_, slot)) => *slot = *last,
+                        None => level.push((channel, *last)),
+                    }
+                }
+            }
+        }
+        level.sort_by_key(|(c, _)| *c);
+        if level.is_empty() {
+            println!("read {n}              no samples arrived");
+        } else {
+            let text: Vec<String> = level
+                .iter()
+                .map(|(c, v)| format!("{c}={}", if *v == 0 { "low" } else { "high" }))
+                .collect();
+            println!("read {n}              {}", text.join("  "));
+        }
+    }
+
+    dev.stream_stop().context("stopping the lines")?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -361,6 +466,7 @@ fn main() -> Result<()> {
         Command::Stats(args) => cmd_stats(&args),
         Command::Capture(args) => cmd_capture(&args),
         Command::Bench(args) => cmd_bench(&args),
+        Command::Gpio(args) => cmd_gpio(&args),
     }
 }
 
@@ -932,6 +1038,8 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     let mut rows_total: u64 = 0;
     // Counted here rather than from the channel counters: an edge is the only
     // evidence a line is connected to anything, as opposed to merely enabled.
+    let mut gpo_high = false;
+    let mut gpo_next = Instant::now();
     let mut edges: Vec<(u8, u64)> = Vec::new();
     // Also the level each line finished at, which is the only way to tell a
     // decoded low from a line that delivered nothing.
@@ -945,6 +1053,14 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         rows_total += n as u64;
         dev.consume(n);
         count_gpi_edges(&mut dev, &mut edges, &mut last_level);
+        if let Some(bits) = args.gpo_toggle {
+            if gpo_next <= Instant::now() {
+                gpo_high = !gpo_high;
+                dev.set_gpo(if gpo_high { bits } else { 0 })
+                    .context("driving the outputs")?;
+                gpo_next = Instant::now() + Duration::from_millis(200);
+            }
+        }
     }
     let elapsed = start.elapsed().as_secs_f64();
     let after = *dev.counters();
@@ -1004,6 +1120,10 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     if rate > 0 {
         let achieved = real as f64 / elapsed / rate as f64 * 100.0;
         println!("rate achieved       {achieved:.2}% of requested (real samples)");
+    }
+    if args.gpo_toggle.is_some() {
+        // Left low, so a session does not leave a line driven.
+        dev.set_gpo(0).context("releasing the outputs")?;
     }
     report_gpi(&gpi, &gpi_before, &edges, &last_level, elapsed);
     report_health(&after, &dev, &signals, elapsed);

@@ -53,6 +53,9 @@ jsctl capture -o run.f32 --rate 1000000 --signals i,v,p --duration 10
 # Same, as CSV
 jsctl capture -o run.csv --format csv --rate 1000 --duration 10
 
+# Read the logic inputs, and drive the outputs
+jsctl gpio --gpio-vref 3v3 --set 0b11 --reads 3
+
 # Capture logic lines alongside the signals
 jsctl bench --duration 5 --gpi 0,1,7 --gpio-vref 3v3
 
@@ -169,6 +172,14 @@ lines report their edges and duty cycle over the same span. The per-plot
 overlay steps aside while the panel is up rather than repeating it over the
 trace it describes.
 
+**Device panel.** `Device` opens the instrument's own settings beside the
+plots: current range (auto, a pinned range, or off), the bounds autoranging
+may choose between, voltage range, what the GPIO inputs compare against, the
+general purpose outputs, whether the trigger line drives or senses, and a
+button to reset the charge and energy accumulators. Everything there applies
+immediately rather than at the next start, because these are questions about
+the measurement and the answer is wanted while watching it.
+
 **Stop does not disturb the target.** Stopping closes the instrument's data
 ports but keeps the device open, so the current path stays shut and whatever
 is being measured keeps running. Starting again takes about 0.35 s. `⏏`
@@ -276,10 +287,15 @@ round-tripping through real files.
 
 GPI **levels** are not verified. Nothing is connected to the input pins here,
 so every line reads low under both Vref settings and no edge has ever been
-observed. The instrument exposes no output that could drive one, so this
-cannot be settled without physically connecting a signal. The decoding itself
-follows the instrument's own driver, which packs these ports eight samples to
-a byte, least significant bit first.
+observed. The decoding itself follows the instrument's own driver, which packs
+these ports eight samples to a byte, least significant bit first.
+
+The instrument does have outputs — `s/gpo/+/!value` drives them, and the
+`Device` panel and `jsctl gpio --set` both reach it — but they are separate
+pins from the inputs: driving OUT 0 and OUT 1 while watching all five inputs
+produced no edge on any of them. A wire from an output to an input would
+settle the decoding in seconds, and `jsctl gpio --reads` prints the levels
+without starting a capture.
 
 ### Two defects that hardware found, and what they teach
 
@@ -342,7 +358,12 @@ hostage until enough replies accumulate to fill it.
   which has the same effect.
 - GPI levels are unverified. The lines stream at exactly 2 Msps with no gaps,
   but nothing is wired to the inputs here, so every line reads low and no edge
-  has been observed. The instrument has no output that could drive one.
+  has been observed. The outputs exist and can be driven, but they are
+  different pins, so proving the decoding still needs a wire.
+- Reading an input level without streaming does not work. `s/gpi/+/!req` is
+  accepted and acknowledged, but the answer is published only to a subscriber
+  and this driver does not implement pub/sub subscription. `jsctl gpio
+  --reads` streams the lines briefly instead, which is reliable.
 - The current-range stream is decoded but not plotted. It is the same packed
   4-bit format as the GPI lines and would show which shunt is engaged at any
   instant, which is worth having when a range change shows up as a step in the

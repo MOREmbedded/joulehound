@@ -105,6 +105,25 @@ pub fn gpi_ctrl(n: u8) -> Option<&'static str> {
     })
 }
 
+/// Force the general purpose outputs to an exact bitmap.
+///
+/// Bit `n` drives output `n`, numbered as the inputs are: 0 through 3, and 7
+/// for the trigger line. Published to the literal `+` topic, which is how the
+/// instrument's own driver addresses these.
+pub const S_GPO_VALUE: &str = "s/gpo/+/!value";
+
+/// Drive the named general purpose outputs high, leaving the rest alone.
+pub const S_GPO_SET: &str = "s/gpo/+/!set";
+
+/// Drive the named general purpose outputs low, leaving the rest alone.
+pub const S_GPO_CLEAR: &str = "s/gpo/+/!clr";
+
+/// Ask the instrument for the present general purpose input levels.
+pub const S_GPI_REQUEST: &str = "s/gpi/+/!req";
+
+/// Whether the trigger line is an input or an output.
+pub const C_TRIGGER_DIR: &str = "c/trigger/dir";
+
 /// Build the control topic for raw ADC channel `n`, 0 through 3.
 pub fn adc_ctrl(n: u8) -> Option<&'static str> {
     Some(match n {

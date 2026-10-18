@@ -26,6 +26,7 @@ fn main() -> eframe::Result<()> {
     // earn a dependency.
     let args: Vec<String> = std::env::args().collect();
     let autostart = args.iter().any(|a| a == "--start");
+    let device_panel = args.iter().any(|a| a == "--device");
     let value = |name: &str| -> Option<String> {
         let i = args.iter().position(|a| a == name)?;
         args.get(i + 1).cloned()
@@ -63,6 +64,7 @@ fn main() -> eframe::Result<()> {
                 gpi.clone(),
                 vref_3v3,
                 markers,
+                device_panel,
             )))
         }),
     )

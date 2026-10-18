@@ -415,6 +415,8 @@ pub struct Js220 {
     adc_map: Option<(u8, u8)>,
     /// General purpose input lines being captured, in request order.
     gpi: Vec<GpiChannel>,
+    /// Pattern the general purpose outputs were last driven to.
+    gpo: u32,
     /// Reused decode buffer for unpacked GPI bits.
     gpi_scratch: Vec<u8>,
     /// The range mode that means on, so the power switch restores whichever
@@ -484,6 +486,7 @@ impl Js220 {
             adc_scratch: Vec::new(),
             adc_map: None,
             gpi: Vec::new(),
+            gpo: 0,
             gpi_scratch: Vec::new(),
             range_mode_on: RANGE_MODE_AUTO,
             range_select_on: 0,
@@ -779,6 +782,120 @@ impl Js220 {
         self.sync_output()?;
         self.target_power = on;
         Ok(())
+    }
+
+    /// Drive the general purpose outputs to an exact pattern.
+    ///
+    /// `bits` is a bitmap over the instrument's own line numbers: bit 0 is
+    /// output 0, and bit 7 the trigger line. The trigger line only follows
+    /// this when it is configured as an output; as an input it ignores it.
+    ///
+    /// Published behind a barrier, because a lost publish here is a line that
+    /// silently never moves.
+    pub fn set_gpo(&mut self, bits: u32) -> Result<()> {
+        self.publish(topics::S_GPO_VALUE, Value::U32(bits))?;
+        self.sync_output()?;
+        self.gpo = bits;
+        Ok(())
+    }
+
+    /// The pattern the general purpose outputs were last set to.
+    pub fn gpo(&self) -> u32 {
+        self.gpo
+    }
+
+    /// Change the current range while streaming.
+    ///
+    /// Published directly rather than through a restart, so a range can be
+    /// pinned while watching the effect. Also records what "on" means, so
+    /// the power switch restores this rather than whatever the session
+    /// started with.
+    pub fn set_current_range(&mut self, range: CurrentRange) -> Result<()> {
+        match range {
+            CurrentRange::Auto => {
+                self.range_mode_on = RANGE_MODE_AUTO;
+                self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_AUTO))?;
+                self.target_power = true;
+            }
+            CurrentRange::Manual(n) => {
+                if n > 5 {
+                    return Err(Error::Config {
+                        reason: format!("current range {n} is outside 0..=5"),
+                    });
+                }
+                self.range_mode_on = RANGE_MODE_MANUAL;
+                self.range_select_on = n;
+                self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_MANUAL))?;
+                self.publish(
+                    topics::S_CURRENT_RANGE_SELECT,
+                    Value::U8(current_range_select(n)),
+                )?;
+                self.target_power = true;
+            }
+            CurrentRange::Off => {
+                self.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_OFF))?;
+                self.target_power = false;
+            }
+        }
+        self.sync_output()
+    }
+
+    /// Bound which ranges autoranging may choose between.
+    ///
+    /// Both are range indices, 0 being the least sensitive. Narrowing them
+    /// stops the instrument hunting across ranges it will never need, which
+    /// is what produces the step a range change leaves in the trace.
+    pub fn set_range_bounds(&mut self, least: u8, most: u8) -> Result<()> {
+        if least > 5 || most > 5 {
+            return Err(Error::Config {
+                reason: format!("range bounds {least}..={most} are outside 0..=5"),
+            });
+        }
+        if least > most {
+            return Err(Error::Config {
+                reason: format!("range bound {least} is more sensitive than {most}"),
+            });
+        }
+        self.publish(topics::S_CURRENT_RANGE_MIN, Value::U8(least))?;
+        self.publish(topics::S_CURRENT_RANGE_MAX, Value::U8(most))?;
+        self.sync_output()
+    }
+
+    /// Change the voltage range while streaming.
+    pub fn set_voltage_range(&mut self, range: VoltageRange) -> Result<()> {
+        match range {
+            VoltageRange::Auto => {
+                self.publish(topics::S_VOLTAGE_RANGE_MODE, Value::U8(V_RANGE_MODE_AUTO))?;
+            }
+            VoltageRange::V2 | VoltageRange::V15 => {
+                let sel = if range == VoltageRange::V2 {
+                    V_RANGE_2V
+                } else {
+                    V_RANGE_15V
+                };
+                self.publish(topics::S_VOLTAGE_RANGE_MODE, Value::U8(V_RANGE_MODE_MANUAL))?;
+                self.publish(topics::S_VOLTAGE_RANGE_SELECT, Value::U8(sel))?;
+            }
+        }
+        self.sync_output()
+    }
+
+    /// Change what the general purpose inputs compare against.
+    pub fn set_gpio_vref(&mut self, vref: GpioVref) -> Result<()> {
+        self.publish(topics::C_GPIO_VREF, Value::U8(vref.code()))?;
+        self.sync_output()
+    }
+
+    /// Choose whether the trigger line is an input or an output.
+    pub fn set_trigger_output(&mut self, output: bool) -> Result<()> {
+        self.publish(topics::C_TRIGGER_DIR, Value::U8(u8::from(output)))?;
+        self.sync_output()
+    }
+
+    /// Clear the on-instrument charge and energy accumulators.
+    pub fn clear_accumulators(&mut self) -> Result<()> {
+        self.publish(topics::S_STATS_CLEAR, Value::U8(1))?;
+        self.sync_output()
     }
 
     /// Round-trip a port 0 echo, confirming the output path and flushing
