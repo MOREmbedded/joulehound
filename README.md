@@ -120,6 +120,26 @@ drawn beside it inside the plot — avg, std, rms, min, max, p2p, and the time
 integral where one is meaningful, so current integrates to charge and power to
 energy but voltage gets none.
 
+**Peaks and thresholds.** *Peaks* marks the tallest local maxima on every
+plot, with a count you choose; each is labelled with its value and time.
+*Thresh*, per plot, takes a level in that plot's own unit — amperes for
+current, watts for power — and shades every region on the chosen side of it,
+reporting the extreme reached and how long the excursion lasted. Both run over
+the aggregated buckets rather than the raw samples, so they find what is
+actually on screen and zooming in refines the answer instead of changing it;
+because a bucket is compared on its extreme rather than its mean, a 2 µs
+excursion inside a 2.5 ms bucket still counts.
+
+**Export** writes the visible span, or just the span between the markers, to
+`.csv` or a real `.xlsx` workbook — the extension picks the format, and xlsx
+carries typed numbers with a frozen header row rather than being a CSV in
+disguise. The span is re-aggregated at the row count you set rather than
+reusing the on-screen buckets, so the file does not inherit the width of the
+window it happened to be exported from. Every row carries the mean, minimum
+and maximum of its time slice, because exporting the mean alone would discard
+exactly the spike the envelope exists to show. Slices no signal reached are
+left out rather than written as `NaN`.
+
 **Recording** writes the same interleaved little-endian `f32` format `jsctl`
 produces, so the two are interchangeable.
 

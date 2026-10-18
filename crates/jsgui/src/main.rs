@@ -13,6 +13,7 @@
 mod acquire;
 mod app;
 mod buffer;
+mod export;
 mod fmt;
 mod peaks;
 mod raw;

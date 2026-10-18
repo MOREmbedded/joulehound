@@ -19,3 +19,13 @@ egui = "0.31"
 egui_plot = "0.31"
 log = "0.4"
 env_logger = "0.11"
+# Real xlsx, so a spreadsheet gets typed numbers rather than a renamed CSV.
+rust_xlsxwriter = "0.100"
+# Native save dialog; picking a file by typing a path into a text box is not
+# what anyone expects from a desktop application.
+rfd = "0.17"
+
+[dev-dependencies]
+# Reads the workbook back in the tests without trusting the writer that made
+# it, so "it produced a file" is not mistaken for "a spreadsheet can open it".
+zip = { version = "9", default-features = false, features = ["deflate"] }

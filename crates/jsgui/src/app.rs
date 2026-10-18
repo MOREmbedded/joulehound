@@ -10,6 +10,7 @@ use egui_plot::{
 
 use crate::acquire::{Acquisition, Command, LogLevel, Shared, Status};
 use crate::buffer::{Bucket, RangeStats, SignalTrace};
+use crate::export::{self, Column};
 use crate::fmt;
 use crate::peaks::{self, Edge};
 use crate::raw::RawTrace;
@@ -169,6 +170,23 @@ pub struct App {
     threshold_on: [bool; VIEWS.len()],
     /// Which side of the threshold counts.
     threshold_edge: Edge,
+    /// The x range actually drawn last frame, which is what "export the view"
+    /// means. Distinct from `view_x`, which is only set once the user has
+    /// panned or zoomed.
+    drawn_x: Option<(f64, f64)>,
+    /// How many rows an export aggregates the span into.
+    export_rows: usize,
+    /// Result of the last export, shown in the status bar.
+    export_status: Option<String>,
+}
+
+/// Which span an export covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportSpan {
+    /// Everything currently on screen.
+    View,
+    /// Only what lies between the two markers.
+    Markers,
 }
 
 /// Identifies one of the two markers.
@@ -217,6 +235,11 @@ impl App {
             threshold: [0.0; VIEWS.len()],
             threshold_on: [false; VIEWS.len()],
             threshold_edge: Edge::Above,
+            drawn_x: None,
+            // Enough to resolve detail in a spreadsheet without producing a
+            // file that takes a minute to open.
+            export_rows: 20_000,
+            export_status: None,
         };
         app.rescan();
         if autostart && app.serial.is_some() {
@@ -242,6 +265,75 @@ impl App {
 
     fn running(&self, shared: &Shared) -> bool {
         matches!(shared.status, Status::Running | Status::Connecting)
+    }
+
+    /// The time span an export would cover, if there is one.
+    fn export_range(&self, span: ExportSpan) -> Option<(f64, f64)> {
+        export_range(span, self.drawn_x, (self.marker_a, self.marker_b))
+    }
+
+    /// Write the visible signals over `span` to a file the user picks.
+    ///
+    /// The span is re-aggregated at the export resolution rather than reusing
+    /// the on-screen buckets, so the file does not inherit the width of the
+    /// window it happened to be exported from.
+    fn export(&mut self, shared: &Shared, span: ExportSpan) {
+        let Some((lo, hi)) = self.export_range(span) else {
+            self.export_status = Some(match span {
+                ExportSpan::View => "Nothing captured to export".to_string(),
+                ExportSpan::Markers => "Place two markers first".to_string(),
+            });
+            return;
+        };
+
+        let views = views_for(shared.source, (0, 1));
+        let coarse = [&shared.current, &shared.voltage, &shared.power];
+        let raw = [&shared.raw_current, &shared.raw_voltage, &shared.raw_power];
+
+        // Collected before the dialog opens: the data is borrowed from the
+        // shared snapshot, and the dialog blocks for as long as the user
+        // takes to answer.
+        let mut data: Vec<(&'static str, &'static str, Vec<Bucket>)> = Vec::new();
+        for (i, view) in views.iter().enumerate() {
+            if !self.visible[i] {
+                continue;
+            }
+            let mut buckets = Vec::new();
+            aggregate_for_view(raw[i], coarse[i], (lo, hi), self.export_rows, &mut buckets);
+            data.push((view.name, view.unit, buckets));
+        }
+        if data.iter().all(|(_, _, b)| b.is_empty()) {
+            self.export_status = Some("No samples in that span".to_string());
+            return;
+        }
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export measurements")
+            .add_filter("Comma separated values", &[export::Format::Csv.extension()])
+            .add_filter("Excel workbook", &[export::Format::Xlsx.extension()])
+            .set_file_name(format!("joulescope.{}", export::Format::Csv.extension()))
+            .save_file()
+        else {
+            // Cancelled: say nothing, because the user already knows.
+            return;
+        };
+
+        let columns: Vec<Column<'_>> = data
+            .iter()
+            .map(|(name, unit, buckets)| Column {
+                name,
+                unit,
+                buckets,
+            })
+            .collect();
+        self.export_status = Some(match export::write(&path, &columns) {
+            Ok(rows) => format!(
+                "Exported {rows} rows x {} signals to {}",
+                columns.len(),
+                path.display()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        });
     }
 
     /// Place both markers around the middle of the current view.
@@ -443,6 +535,43 @@ impl App {
                 }
 
                 ui.separator();
+                ui.menu_button("💾 Export", |ui| {
+                    ui.label("Aggregate the span into");
+                    ui.add(
+                        egui::DragValue::new(&mut self.export_rows)
+                            .range(100..=1_000_000)
+                            .speed(50.0)
+                            .suffix(" rows"),
+                    )
+                    .on_hover_text(
+                        "Each row carries the mean, minimum and maximum of one                          time slice, so short spikes survive the export.",
+                    );
+                    ui.separator();
+                    let markers = self.export_range(ExportSpan::Markers).is_some();
+                    if ui
+                        .add_enabled(
+                            self.drawn_x.is_some(),
+                            egui::Button::new("The visible span…"),
+                        )
+                        .on_hover_text("Every signal shown, over the time range on screen")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.export(shared, ExportSpan::View);
+                    }
+                    if ui
+                        .add_enabled(markers, egui::Button::new("Between the markers…"))
+                        .on_hover_text("Only what lies between marker A and marker B")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.export(shared, ExportSpan::Markers);
+                    }
+                    ui.separator();
+                    ui.weak("The extension picks the format: .csv or .xlsx");
+                });
+
+                ui.separator();
                 if shared.recording.is_some() {
                     if ui.button("⏹ Rec").clicked() {
                         self.acq.send(Command::RecordStop);
@@ -544,6 +673,21 @@ impl App {
                     );
                     ui.weak(p.display().to_string());
                 }
+                if let Some(message) = self.export_status.clone() {
+                    ui.separator();
+                    let failed = message.starts_with("Export failed");
+                    let colour = if failed {
+                        egui::Color32::from_rgb(240, 120, 120)
+                    } else {
+                        egui::Color32::from_rgb(140, 200, 255)
+                    };
+                    ui.colored_label(colour, &message);
+                    // Dismissible, because a path is long and the bar is
+                    // otherwise the only place live numbers are read.
+                    if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
+                        self.export_status = None;
+                    }
+                }
             });
         });
     }
@@ -594,6 +738,9 @@ impl App {
             // Every plot shares one x range so the signals stay aligned, which
             // is what makes a marker meaningful across all three.
             let x_range = self.resolve_x_range(raw[I], coarse[I]);
+            // What "export the view" refers to, whether or not the user has
+            // taken the axis over.
+            self.drawn_x = Some(x_range);
 
             for &i in &shown {
                 let view = &VIEWS[i];
@@ -796,6 +943,25 @@ fn aggregate_for_view(
     out.clear();
     if !coarse.is_empty() {
         coarse.aggregate(x.0, x.1, columns, out);
+    }
+}
+
+/// The time span an export covers, given what is drawn and where the markers
+/// are.
+///
+/// A marker export needs two distinct markers: one marker bounds nothing, and
+/// two in the same place bound an empty span.
+fn export_range(
+    span: ExportSpan,
+    drawn: Option<(f64, f64)>,
+    markers: (Option<f64>, Option<f64>),
+) -> Option<(f64, f64)> {
+    match span {
+        ExportSpan::View => drawn.filter(|(lo, hi)| hi > lo),
+        ExportSpan::Markers => match markers {
+            (Some(a), Some(b)) if a != b => Some((a.min(b), a.max(b))),
+            _ => None,
+        },
     }
 }
 
@@ -1575,6 +1741,104 @@ mod tests {
         let mut out = Vec::new();
         aggregate_for_view(&raw, &coarse, (0.0, 10.0), 100, &mut out);
         assert!(!out.is_empty(), "history must still be drawn");
+    }
+
+    #[test]
+    fn the_whole_export_path_carries_a_spike_through_to_the_file() {
+        // The path the Export button actually takes: raw samples, aggregated
+        // to the export resolution, written out. A 1-sample spike must still
+        // be in the file after being folded into a bucket, because that is
+        // the measurement someone exports to prove.
+        let mut raw = RawTrace::new(4096);
+        raw.reconfigure(4096, 1e-6);
+        let mut samples = vec![0.1f32; 1000];
+        samples[500] = 7.5;
+        raw.push(&samples, 0);
+
+        let coarse = SignalTrace::new(8);
+        let mut buckets = Vec::new();
+        // Deliberately coarser than the data, so the spike has to survive
+        // being averaged with its neighbours.
+        aggregate_for_view(&raw, &coarse, (0.0, 9e-4), 50, &mut buckets);
+        assert!(!buckets.is_empty());
+
+        let columns = vec![Column {
+            name: "Current",
+            unit: "A",
+            buckets: &buckets,
+        }];
+        let path = std::env::temp_dir().join(format!("jsgui-path-{}.csv", std::process::id()));
+        let rows = export::write(&path, &columns).unwrap();
+        assert!(rows > 0);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let peak = text
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split(',').nth(3))
+            .filter_map(|f| f.parse::<f64>().ok())
+            .fold(f64::MIN, f64::max);
+        assert!(
+            (peak - 7.5).abs() < 1e-3,
+            "the spike was averaged away: peak column reads {peak}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exporting_the_view_uses_what_was_drawn() {
+        let r = export_range(ExportSpan::View, Some((1.0, 5.0)), (None, None));
+        assert_eq!(r, Some((1.0, 5.0)));
+    }
+
+    #[test]
+    fn exporting_the_view_needs_something_drawn() {
+        assert_eq!(export_range(ExportSpan::View, None, (None, None)), None);
+        // A collapsed axis would export an empty span.
+        assert_eq!(
+            export_range(ExportSpan::View, Some((2.0, 2.0)), (None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn exporting_the_markers_ignores_the_drawn_range() {
+        // Markers routinely sit inside the view; the export must follow them,
+        // not the window.
+        let r = export_range(
+            ExportSpan::Markers,
+            Some((0.0, 100.0)),
+            (Some(3.0), Some(7.0)),
+        );
+        assert_eq!(r, Some((3.0, 7.0)));
+    }
+
+    #[test]
+    fn marker_order_does_not_matter_to_an_export() {
+        let a = export_range(ExportSpan::Markers, None, (Some(7.0), Some(3.0)));
+        let b = export_range(ExportSpan::Markers, None, (Some(3.0), Some(7.0)));
+        assert_eq!(a, b);
+        assert_eq!(a, Some((3.0, 7.0)));
+    }
+
+    #[test]
+    fn one_marker_bounds_nothing_to_export() {
+        assert_eq!(
+            export_range(ExportSpan::Markers, Some((0.0, 1.0)), (Some(3.0), None)),
+            None
+        );
+        assert_eq!(
+            export_range(ExportSpan::Markers, Some((0.0, 1.0)), (None, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn two_markers_in_the_same_place_bound_nothing() {
+        assert_eq!(
+            export_range(ExportSpan::Markers, None, (Some(4.0), Some(4.0))),
+            None
+        );
     }
 
     #[test]
