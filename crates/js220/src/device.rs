@@ -12,6 +12,7 @@ use js220_proto::topics;
 use js220_proto::value::{flags, Value};
 
 use crate::error::{Error, Result};
+use crate::gpi::{GpiBlock, GpiChannel};
 use crate::signals::{Signal, SignalGroup};
 use crate::time::{self, TimeMap};
 use crate::usb::{DeviceInfo, Link, Mode, TransportConfig};
@@ -145,6 +146,33 @@ pub enum VoltageRange {
     V15,
 }
 
+/// Reference the general purpose inputs compare against.
+///
+/// With [`GpioVref::External`] the instrument senses against a reference you
+/// supply on the Vref pin; with nothing connected there the inputs read a
+/// fixed level and no edge ever appears. [`GpioVref::V3p3`] has the
+/// instrument supply 3.3 V itself, which is what a 3.3 V logic system needs
+/// when it is not driving Vref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpioVref {
+    /// Sense against the externally supplied Vref. The instrument's own
+    /// default.
+    #[default]
+    External,
+    /// Sense against 3.3 V supplied by the instrument.
+    V3p3,
+}
+
+impl GpioVref {
+    /// The value the `c/gpio/vref` topic takes.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::External => 0,
+            Self::V3p3 => 1,
+        }
+    }
+}
+
 /// What to stream and how.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
@@ -168,6 +196,20 @@ pub struct StreamConfig {
     /// averaging. [`Source::RawAdc`] ignores this and always runs at
     /// [`BASE_RATE`].
     pub sample_rate: u32,
+    /// General purpose input lines to stream, by the instrument's own
+    /// channel numbers: 0 through 3 are the external inputs and 7 is the
+    /// trigger input.
+    ///
+    /// These run at [`BASE_RATE`] regardless of `sample_rate`, because the
+    /// point of a logic line is where its edges fall. Empty by default: an
+    /// unused line costs USB bandwidth for nothing.
+    pub gpi: Vec<u8>,
+    /// What the general purpose inputs compare against.
+    ///
+    /// Only applied when [`StreamConfig::gpi`] asks for at least one line, so
+    /// a session that does not use them leaves the instrument's own setting
+    /// alone.
+    pub gpio_vref: GpioVref,
     /// Enable the on-instrument statistics stream.
     pub statistics: bool,
     /// Statistics block rate in Hz, when statistics are enabled.
@@ -184,6 +226,8 @@ impl Default for StreamConfig {
             source: Source::Calibrated,
             signals: vec![Signal::Current, Signal::Voltage, Signal::Power],
             adc_channels: (0, 1),
+            gpi: Vec::new(),
+            gpio_vref: GpioVref::External,
             sample_rate: MAX_SAMPLE_RATE,
             statistics: false,
             statistics_rate: 2.0,
@@ -203,6 +247,21 @@ impl StreamConfig {
             return Err(Error::Config {
                 reason: "no signals selected and statistics are disabled".into(),
             });
+        }
+        for (i, ch) in self.gpi.iter().enumerate() {
+            if pstream::gpi_index(*ch).is_none() {
+                return Err(Error::Config {
+                    reason: format!(
+                        "GPI channel {ch} does not exist; the instrument has {:?}",
+                        pstream::GPI_CHANNELS
+                    ),
+                });
+            }
+            if self.gpi[..i].contains(ch) {
+                return Err(Error::Config {
+                    reason: format!("GPI channel {ch} requested twice"),
+                });
+            }
         }
         if self.source == Source::RawAdc {
             for ch in [self.adc_channels.0, self.adc_channels.1] {
@@ -347,6 +406,10 @@ pub struct Js220 {
     /// ADC channels standing in for the current and voltage slots while
     /// streaming [`Source::RawAdc`].
     adc_map: Option<(u8, u8)>,
+    /// General purpose input lines being captured, in request order.
+    gpi: Vec<GpiChannel>,
+    /// Reused decode buffer for unpacked GPI bits.
+    gpi_scratch: Vec<u8>,
     /// The range mode that means on, so the power switch restores whichever
     /// of auto or manual the caller configured.
     range_mode_on: u8,
@@ -413,6 +476,8 @@ impl Js220 {
             scratch: Vec::new(),
             adc_scratch: Vec::new(),
             adc_map: None,
+            gpi: Vec::new(),
+            gpi_scratch: Vec::new(),
             range_mode_on: RANGE_MODE_AUTO,
             range_select_on: 0,
             target_power: true,
@@ -467,6 +532,9 @@ impl Js220 {
         // of it; they are applied in order and the list is long.
         self.drain(SETTLE);
         self.group.reset();
+        for channel in &mut self.gpi {
+            channel.reset();
+        }
         Ok(())
     }
 
@@ -779,6 +847,22 @@ impl Js220 {
             }
         }
 
+        // GPI runs at the base rate on both acquisition paths, so the fill
+        // bound is counted in base samples rather than output samples.
+        let gpi_max_fill = (BASE_RATE as usize / 100).max(16);
+        self.gpi.clear();
+        self.gpi_scratch.clear();
+        if !config.gpi.is_empty() {
+            self.publish(topics::C_GPIO_VREF, Value::U8(config.gpio_vref.code()))?;
+        }
+        for &channel in &config.gpi {
+            let topic = topics::gpi_ctrl(channel).ok_or_else(|| Error::Config {
+                reason: format!("GPI channel {channel} does not exist"),
+            })?;
+            self.publish(topic, Value::U8(1))?;
+            self.gpi.push(GpiChannel::new(channel, gpi_max_fill));
+        }
+
         if config.statistics {
             self.publish(
                 topics::S_STATS_SCNT,
@@ -786,6 +870,13 @@ impl Js220 {
             )?;
             self.publish(topics::S_STATS_CTRL, Value::U8(1))?;
         }
+
+        // The configuration above is a burst of publishes, and a completed
+        // bulk OUT transfer is not evidence the device received one. Without
+        // this barrier the tail of the burst is silently lost: enabling five
+        // GPI lines reliably produced three or four of them, varying run to
+        // run, because the last publishes never landed.
+        self.sync_output()?;
 
         self.link.prime();
         self.config = Some(config);
@@ -828,6 +919,16 @@ impl Js220 {
                 }
             }
         }
+        // Every GPI line, not only the ones this session asked for: a
+        // previous session may have left one on.
+        for &ch in &pstream::GPI_CHANNELS {
+            if let Some(topic) = topics::gpi_ctrl(ch) {
+                if let Err(e) = self.publish(topic, Value::U8(0)) {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        self.gpi.clear();
         self.adc_map = None;
         self.group.reset();
         self.power.clear();
@@ -981,6 +1082,13 @@ impl Js220 {
             return;
         }
 
+        // GPI lines run alongside either acquisition path and are not part of
+        // the aligned row set, so they are handled before the signal map.
+        if let Some(channel) = pstream::gpi_channel(index) {
+            self.on_gpi(channel, payload);
+            return;
+        }
+
         // In raw mode the ADC ports stand in for current and voltage, and
         // carry i16 counts rather than f32 units.
         let (signal, raw_adc) = match self.adc_map {
@@ -1028,6 +1136,50 @@ impl Js220 {
         }
         self.group.push(signal, raw_id, &scratch);
         self.scratch = scratch;
+    }
+
+    /// Decode one general purpose input frame into its channel.
+    fn on_gpi(&mut self, channel: u8, payload: &[u8]) {
+        let Some(slot) = self.gpi.iter().position(|c| c.channel() == channel) else {
+            // A line left enabled by a previous session, or one this session
+            // did not ask for. Counted, not decoded.
+            self.counters.ignored_frames += 1;
+            return;
+        };
+        let Some((raw_id, data)) = pstream::split_sample_id(payload) else {
+            log::debug!("GPI {channel} frame too short for a sample id");
+            return;
+        };
+
+        // Moved out and back so the decode buffer can be borrowed while the
+        // channel is mutated, the same shape the sample path uses.
+        let mut bits = std::mem::take(&mut self.gpi_scratch);
+        bits.clear();
+        pstream::decode_u1_packed(data, &mut bits);
+        self.gpi[slot].push(raw_id, &bits);
+        self.gpi_scratch = bits;
+    }
+
+    /// Take the general purpose input samples accumulated since the last call.
+    ///
+    /// Each entry is a channel number and its blocks, which carry device
+    /// sample ids at [`BASE_RATE`] — the same counter [`Rows::sample_id`]
+    /// reports, which is what lets a logic line be placed against an analog
+    /// trace.
+    pub fn take_gpi(&mut self) -> Vec<(u8, Vec<GpiBlock>)> {
+        self.gpi
+            .iter_mut()
+            .filter(|c| !c.is_empty())
+            .map(|c| (c.channel(), c.take()))
+            .collect()
+    }
+
+    /// Running totals for each general purpose input line being captured.
+    pub fn gpi_counters(&self) -> Vec<(u8, crate::gpi::GpiCounters)> {
+        self.gpi
+            .iter()
+            .map(|c| (c.channel(), c.counters()))
+            .collect()
     }
 
     /// Borrow the aligned rows currently available.
@@ -1124,6 +1276,57 @@ mod tests {
         assert!(cfg(999).validate().is_err(), "below the minimum");
         assert!(cfg(2_000_000).validate().is_err(), "above the maximum");
         assert!(cfg(300_000).validate().is_err(), "does not divide 2 MHz");
+    }
+
+    #[test]
+    fn no_gpi_line_is_streamed_unless_asked_for() {
+        // An unused line costs USB bandwidth for nothing.
+        assert!(StreamConfig::default().gpi.is_empty());
+    }
+
+    #[test]
+    fn every_gpi_line_the_instrument_has_is_accepted() {
+        for &ch in &pstream::GPI_CHANNELS {
+            let c = StreamConfig {
+                gpi: vec![ch],
+                ..Default::default()
+            };
+            assert!(c.validate().is_ok(), "channel {ch} rejected");
+        }
+    }
+
+    #[test]
+    fn a_gpi_line_the_instrument_does_not_have_is_rejected() {
+        // 4, 5 and 6 look plausible and do not exist.
+        for ch in [4u8, 5, 6, 8] {
+            let c = StreamConfig {
+                gpi: vec![ch],
+                ..Default::default()
+            };
+            assert!(c.validate().is_err(), "channel {ch} accepted");
+        }
+    }
+
+    #[test]
+    fn a_gpi_line_cannot_be_requested_twice() {
+        let c = StreamConfig {
+            gpi: vec![0, 1, 0],
+            ..Default::default()
+        };
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("twice"), "got {err}");
+    }
+
+    #[test]
+    fn gpi_is_validated_on_the_raw_adc_path_too() {
+        // Raw ADC returns early from the rate checks; the GPI list must not
+        // slip through with it.
+        let c = StreamConfig {
+            source: Source::RawAdc,
+            gpi: vec![9],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
     }
 
     #[test]

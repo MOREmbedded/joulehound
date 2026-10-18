@@ -47,10 +47,10 @@ pub enum Encoding {
     F32,
     /// 16-bit signed integers, uncompressed.
     I16,
-    /// 4-bit values, run-length encoded in 16-bit chunks.
-    U4Rle,
-    /// 1-bit values, run-length encoded in a byte-oriented scheme.
-    U1Rle,
+    /// 4-bit values, two to a byte, low nibble first.
+    U4,
+    /// 1-bit values, eight to a byte, least significant bit first.
+    U1,
     /// 8-bit values, uncompressed.
     U8,
     /// A fixed-layout record rather than a sample sequence.
@@ -125,7 +125,7 @@ pub static PORT_MAP: [PortDef; PORT_COUNT] = [
         "s/i/range/ctrl",
         "s/i/range/!data",
         Signal::CurrentRange,
-        Encoding::U4Rle,
+        Encoding::U4,
         1,
     ),
     port("s/i/ctrl", "s/i/!data", Signal::Current, Encoding::F32, 2),
@@ -135,35 +135,35 @@ pub static PORT_MAP: [PortDef; PORT_COUNT] = [
         "s/gpi/0/ctrl",
         "s/gpi/0/!data",
         Signal::Gpi(0),
-        Encoding::U1Rle,
+        Encoding::U1,
         1,
     ),
     port(
         "s/gpi/1/ctrl",
         "s/gpi/1/!data",
         Signal::Gpi(1),
-        Encoding::U1Rle,
+        Encoding::U1,
         1,
     ),
     port(
         "s/gpi/2/ctrl",
         "s/gpi/2/!data",
         Signal::Gpi(2),
-        Encoding::U1Rle,
+        Encoding::U1,
         1,
     ),
     port(
         "s/gpi/3/ctrl",
         "s/gpi/3/!data",
         Signal::Gpi(3),
-        Encoding::U1Rle,
+        Encoding::U1,
         1,
     ),
     port(
         "s/gpi/7/ctrl",
         "s/gpi/7/!data",
         Signal::Gpi(7),
-        Encoding::U1Rle,
+        Encoding::U1,
         1,
     ),
     port(
@@ -195,6 +195,33 @@ pub const IDX_CURRENT: u8 = 5;
 pub const IDX_VOLTAGE: u8 = 6;
 /// Stream index of the power signal.
 pub const IDX_POWER: u8 = 7;
+/// Stream index of the first general purpose input.
+pub const IDX_GPI_FIRST: u8 = 8;
+/// Stream index of the last general purpose input.
+pub const IDX_GPI_LAST: u8 = 12;
+
+/// General purpose input channels the instrument exposes, in port order.
+///
+/// Channels 0 through 3 are the external inputs; 7 is the trigger input. The
+/// numbering is the instrument's own and is not contiguous.
+pub const GPI_CHANNELS: [u8; 5] = [0, 1, 2, 3, 7];
+
+/// Stream index carrying general purpose input `channel`.
+pub fn gpi_index(channel: u8) -> Option<u8> {
+    GPI_CHANNELS
+        .iter()
+        .position(|c| *c == channel)
+        .map(|i| IDX_GPI_FIRST + i as u8)
+}
+
+/// The general purpose input channel a stream index carries.
+pub fn gpi_channel(index: u8) -> Option<u8> {
+    if !(IDX_GPI_FIRST..=IDX_GPI_LAST).contains(&index) {
+        return None;
+    }
+    GPI_CHANNELS.get((index - IDX_GPI_FIRST) as usize).copied()
+}
+
 /// Stream index of the UART signal.
 pub const IDX_UART: u8 = 13;
 /// Stream index of the statistics records.
@@ -294,102 +321,50 @@ pub fn decode_i16(data: &[u8], out: &mut Vec<i16>) -> usize {
     n
 }
 
-/// Largest run a single `u4` run-length chunk can express.
-pub const U4_RUN_MAX: u16 = 4096;
-
-/// Decode the run-length encoded 4-bit current range stream.
-///
-/// Each 16-bit little-endian chunk is `zzzzzzzz_zzzzxxxx`: the low nibble is
-/// the value and the upper 12 bits are the run length minus one, giving runs of
-/// 1 to 4096 samples.
-///
-/// Note: current JS220 firmware ships this stream uncompressed, so this path is
-/// exercised by the unit tests below rather than by hardware.
-pub fn decode_u4_rle(data: &[u8], out: &mut Vec<u8>) -> usize {
-    let mut n = 0;
-    for chunk in data.chunks_exact(2) {
-        let word = u16::from_le_bytes(chunk.try_into().expect("chunks_exact(2)"));
-        let value = (word & 0x000f) as u8;
-        let run = (word >> 4) as usize + 1;
-        out.resize(out.len() + run, value);
-        n += run;
-    }
-    n
+/// Samples packed into one byte, for a sub-byte element size.
+pub const fn samples_per_byte(bits: u8) -> usize {
+    (8 / bits) as usize
 }
 
-/// Errors from the 1-bit run-length decoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum U1Error {
-    /// A long-run marker was cut off before its second byte.
-    Truncated,
-    /// The reserved `111` prefix was encountered.
-    Reserved {
-        /// The offending byte.
-        byte: u8,
-    },
+/// Number of samples a sub-byte payload carries.
+///
+/// The instrument sizes its frames in bytes, so the count follows from the
+/// payload length and the element width rather than being carried explicitly:
+/// `(bytes * 8) / bits`.
+pub const fn packed_sample_count(bytes: usize, bits: u8) -> usize {
+    (bytes * 8) / bits as usize
 }
 
-impl core::fmt::Display for U1Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Truncated => write!(f, "u1 long-run marker truncated"),
-            Self::Reserved { byte } => write!(f, "u1 reserved prefix in byte {byte:#04x}"),
+/// Unpack the 1-bit stream carried by the GPI ports.
+///
+/// Eight samples to a byte, least significant bit first, which is the order
+/// the instrument's own host driver reads them in. Each sample appends a 0 or
+/// a 1 to `out`.
+///
+/// There is no run-length encoding here. The port map declares these as
+/// 1-bit unsigned elements and the frame carries them packed, so a payload
+/// length alone fixes the sample count.
+pub fn decode_u1_packed(data: &[u8], out: &mut Vec<u8>) -> usize {
+    out.reserve(data.len() * 8);
+    for byte in data {
+        for bit in 0..8 {
+            out.push((byte >> bit) & 1);
         }
     }
+    data.len() * 8
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for U1Error {}
-
-/// Decode the run-length encoded 1-bit stream used by GPI and voltage range.
+/// Unpack the 4-bit stream carried by the current-range port.
 ///
-/// Three token forms, distinguished by their high bits:
-///
-/// ```text
-/// 0xxxxxxx           seven literal samples, least significant bit first
-/// 10xzzzzz           run of (z + 8) samples of value x, 8..=39
-/// 110xzzzz zzzzzzzz  run of (z + 40) samples of value x, 40..=4135
-/// ```
-///
-/// Note: current JS220 firmware ships these streams uncompressed, so this path
-/// is exercised by the unit tests below rather than by hardware. The bit order
-/// within a literal token follows the little-endian convention used everywhere
-/// else in this protocol, but has not been confirmed against a device.
-pub fn decode_u1_rle(data: &[u8], out: &mut Vec<u8>) -> Result<usize, U1Error> {
-    let mut n = 0;
-    let mut i = 0;
-    while i < data.len() {
-        let b = data[i];
-        if b & 0x80 == 0 {
-            // Literal: seven samples packed into the low bits.
-            for bit in 0..7 {
-                out.push((b >> bit) & 1);
-            }
-            n += 7;
-            i += 1;
-        } else if b & 0x40 == 0 {
-            // 10xzzzzz
-            let value = (b >> 5) & 1;
-            let run = (b & 0x1f) as usize + 8;
-            out.resize(out.len() + run, value);
-            n += run;
-            i += 1;
-        } else if b & 0x20 == 0 {
-            // 110xzzzz zzzzzzzz
-            let Some(&lo) = data.get(i + 1) else {
-                return Err(U1Error::Truncated);
-            };
-            let value = (b >> 4) & 1;
-            let z = (((b & 0x0f) as usize) << 8) | lo as usize;
-            let run = z + 40;
-            out.resize(out.len() + run, value);
-            n += run;
-            i += 2;
-        } else {
-            return Err(U1Error::Reserved { byte: b });
-        }
+/// Two samples to a byte, low nibble first, matching the bit order of
+/// [`decode_u1_packed`].
+pub fn decode_u4_packed(data: &[u8], out: &mut Vec<u8>) -> usize {
+    out.reserve(data.len() * 2);
+    for byte in data {
+        out.push(byte & 0x0f);
+        out.push(byte >> 4);
     }
-    Ok(n)
+    data.len() * 2
 }
 
 /// Multiply current and voltage sample-wise into power.
@@ -531,90 +506,103 @@ mod tests {
     }
 
     #[test]
-    fn u4_rle_expands_runs() {
-        // Chunks are `zzzzzzzz_zzzzxxxx`: run length minus one, then value.
-        let chunk = |value: u16, run: u16| (value | ((run - 1) << 4)).to_le_bytes();
-        let mut data = Vec::new();
-        data.extend_from_slice(&chunk(3, 1));
-        data.extend_from_slice(&chunk(5, 4096));
+    fn u1_unpacks_eight_samples_a_byte_least_significant_first() {
         let mut out = Vec::new();
-        let n = decode_u4_rle(&data, &mut out);
-        assert_eq!(n, 1 + 4096);
-        assert_eq!(out[0], 3);
-        assert!(out[1..].iter().all(|&v| v == 5));
+        assert_eq!(decode_u1_packed(&[0b0101_0101], &mut out), 8);
+        assert_eq!(out, vec![1, 0, 1, 0, 1, 0, 1, 0]);
     }
 
     #[test]
-    fn u4_rle_run_length_bounds_match_the_spec() {
+    fn u1_keeps_byte_order_across_a_payload() {
+        // A line that goes high for one sample must come back at exactly the
+        // sample it went high at, whichever byte it lands in.
         let mut out = Vec::new();
-        decode_u4_rle(&(0u16).to_le_bytes(), &mut out);
-        assert_eq!(out.len(), 1, "minimum run is 1");
-        out.clear();
-        decode_u4_rle(&(0xfff0u16).to_le_bytes(), &mut out);
-        assert_eq!(out.len(), U4_RUN_MAX as usize, "maximum run is 4096");
+        decode_u1_packed(&[0x00, 0b0000_1000], &mut out);
+        assert_eq!(out.len(), 16);
+        assert_eq!(out.iter().position(|&v| v == 1), Some(11));
     }
 
     #[test]
-    fn u1_literal_unpacks_seven_bits_lsb_first() {
+    fn u1_of_nothing_is_nothing() {
         let mut out = Vec::new();
-        // 0b0_1010101 -> 1,0,1,0,1,0,1
-        assert_eq!(decode_u1_rle(&[0b0101_0101], &mut out).unwrap(), 7);
-        assert_eq!(out, vec![1, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(decode_u1_packed(&[], &mut out), 0);
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn u1_short_run_covers_eight_to_thirty_nine() {
+    fn u4_unpacks_two_samples_a_byte_low_nibble_first() {
         let mut out = Vec::new();
-        // 10 x=1 z=0 -> eight ones
-        decode_u1_rle(&[0b1010_0000], &mut out).unwrap();
-        assert_eq!(out, vec![1; 8]);
-
-        out.clear();
-        // 10 x=0 z=31 -> thirty-nine zeros
-        decode_u1_rle(&[0b1001_1111], &mut out).unwrap();
-        assert_eq!(out, vec![0; 39]);
+        assert_eq!(decode_u4_packed(&[0x53], &mut out), 2);
+        assert_eq!(out, vec![3, 5]);
     }
 
     #[test]
-    fn u1_long_run_covers_forty_to_four_thousand_one_hundred_thirty_five() {
-        let mut out = Vec::new();
-        // 110 x=1 z=0 -> forty ones
-        decode_u1_rle(&[0b1101_0000, 0x00], &mut out).unwrap();
-        assert_eq!(out, vec![1; 40]);
-
-        out.clear();
-        // 110 x=0 z=4095 -> 4135 zeros
-        decode_u1_rle(&[0b1100_1111, 0xff], &mut out).unwrap();
-        assert_eq!(out.len(), 4135);
-        assert!(out.iter().all(|&v| v == 0));
+    fn the_sample_count_follows_from_the_payload_length() {
+        // The instrument carries no explicit count: the frame length and the
+        // element width fix it.
+        assert_eq!(packed_sample_count(1, 1), 8);
+        assert_eq!(packed_sample_count(64, 1), 512);
+        assert_eq!(packed_sample_count(1, 4), 2);
+        assert_eq!(packed_sample_count(0, 1), 0);
+        assert_eq!(samples_per_byte(1), 8);
+        assert_eq!(samples_per_byte(4), 2);
     }
 
     #[test]
-    fn u1_mixed_tokens_concatenate() {
-        let mut out = Vec::new();
-        let n = decode_u1_rle(&[0b0000_0001, 0b1010_0000], &mut out).unwrap();
-        assert_eq!(n, 7 + 8);
-        assert_eq!(out[0], 1);
-        assert!(out[1..7].iter().all(|&v| v == 0));
-        assert!(out[7..].iter().all(|&v| v == 1));
+    fn a_decoded_payload_is_as_long_as_the_count_predicts() {
+        for len in [0usize, 1, 7, 64, 255] {
+            let data = vec![0xa5u8; len];
+            let mut out = Vec::new();
+            assert_eq!(
+                decode_u1_packed(&data, &mut out),
+                packed_sample_count(len, 1)
+            );
+            assert_eq!(out.len(), packed_sample_count(len, 1));
+
+            let mut out4 = Vec::new();
+            assert_eq!(
+                decode_u4_packed(&data, &mut out4),
+                packed_sample_count(len, 4)
+            );
+            assert_eq!(out4.len(), packed_sample_count(len, 4));
+        }
     }
 
     #[test]
-    fn u1_truncated_long_run_is_an_error() {
-        let mut out = Vec::new();
-        assert_eq!(
-            decode_u1_rle(&[0b1101_0000], &mut out).unwrap_err(),
-            U1Error::Truncated
-        );
+    fn gpi_channels_and_stream_indices_agree_with_the_port_map() {
+        for &channel in &GPI_CHANNELS {
+            let index = gpi_index(channel).expect("every listed channel has a port");
+            assert_eq!(gpi_channel(index), Some(channel), "round trip");
+            assert_eq!(PORT_MAP[index as usize].signal, Signal::Gpi(channel));
+            assert_eq!(
+                PORT_MAP[index as usize].ctrl_topic,
+                crate::topics::gpi_ctrl(channel)
+            );
+        }
     }
 
     #[test]
-    fn u1_reserved_prefix_is_an_error() {
-        let mut out = Vec::new();
-        assert_eq!(
-            decode_u1_rle(&[0b1110_0000], &mut out).unwrap_err(),
-            U1Error::Reserved { byte: 0b1110_0000 }
-        );
+    fn channels_the_instrument_does_not_have_map_to_nothing() {
+        // 4, 5 and 6 look plausible and are not there.
+        for channel in [4u8, 5, 6, 8, 255] {
+            assert_eq!(gpi_index(channel), None, "channel {channel}");
+        }
+        assert_eq!(gpi_channel(IDX_GPI_FIRST - 1), None);
+        assert_eq!(gpi_channel(IDX_GPI_LAST + 1), None);
+    }
+
+    #[test]
+    fn the_gpi_and_range_ports_declare_the_packed_encodings() {
+        for (offset, port) in PORT_MAP
+            .iter()
+            .enumerate()
+            .skip(IDX_GPI_FIRST as usize)
+            .take(GPI_CHANNELS.len())
+        {
+            assert_eq!(port.encoding, Encoding::U1, "port {offset}");
+            assert_eq!(port.decimate_min, 1, "GPI runs at the base rate");
+        }
+        assert_eq!(PORT_MAP[4].encoding, Encoding::U4);
     }
 
     #[test]

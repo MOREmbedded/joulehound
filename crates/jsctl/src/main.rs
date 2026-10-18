@@ -118,6 +118,31 @@ struct StreamArgs {
     /// Hold a fixed voltage range instead of auto-ranging.
     #[arg(long, value_name = "RANGE")]
     voltage_range: Option<VoltageRangeArg>,
+
+    /// General purpose inputs to capture, comma separated: 0, 1, 2, 3, 7.
+    ///
+    /// These run at the full 2 MHz whatever --rate says, because the point of
+    /// a logic line is where its edges fall. Channel 7 is the trigger input.
+    #[arg(long, value_name = "LIST")]
+    gpi: Option<String>,
+
+    /// What the general purpose inputs compare against.
+    ///
+    /// `external` senses against the Vref pin you drive; with nothing
+    /// connected there the inputs read a fixed level and no edge appears.
+    /// `3v3` has the instrument supply the reference itself.
+    #[arg(long, value_enum, default_value_t = GpioVrefArg::External)]
+    gpio_vref: GpioVrefArg,
+}
+
+/// What the general purpose inputs compare against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum GpioVrefArg {
+    /// Sense against the externally supplied Vref.
+    External,
+    /// Sense against 3.3 V supplied by the instrument.
+    #[value(name = "3v3")]
+    V3p3,
 }
 
 /// Which acquisition path to stream.
@@ -167,6 +192,26 @@ impl StreamArgs {
         }
     }
 
+    /// The general purpose input channels requested, if any.
+    fn gpi(&self) -> Result<Vec<u8>> {
+        let Some(list) = self.gpi.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let n: u8 = part
+                .parse()
+                .with_context(|| format!("unknown GPI channel {part:?}"))?;
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        if out.is_empty() {
+            bail!("--gpi selected nothing");
+        }
+        Ok(out)
+    }
+
     fn config(&self, statistics: bool, statistics_rate: f64) -> Result<StreamConfig> {
         let cfg = StreamConfig {
             source: match self.source {
@@ -175,6 +220,11 @@ impl StreamArgs {
             },
             adc_channels: (0, 1),
             signals: self.signals()?,
+            gpi: self.gpi()?,
+            gpio_vref: match self.gpio_vref {
+                GpioVrefArg::External => js220::GpioVref::External,
+                GpioVrefArg::V3p3 => js220::GpioVref::V3p3,
+            },
             sample_rate: self.rate,
             statistics,
             statistics_rate,
@@ -783,6 +833,9 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         dev.poll(POLL_TIMEOUT)?;
         let n = dev.rows().len;
         dev.consume(n);
+        // Discarded: a backlog accumulated before the clock starts would be
+        // charged against the measured window.
+        let _ = dev.take_gpi();
     }
 
     let before = *dev.counters();
@@ -795,6 +848,12 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(args.duration);
     let mut rows_total: u64 = 0;
+    // Counted here rather than from the channel counters: an edge is the only
+    // evidence a line is connected to anything, as opposed to merely enabled.
+    let mut edges: Vec<(u8, u64)> = Vec::new();
+    // Also the level each line finished at, which is the only way to tell a
+    // decoded low from a line that delivered nothing.
+    let mut last_level: Vec<(u8, u8)> = Vec::new();
     while Instant::now() < deadline {
         if interrupted.load(Ordering::Relaxed) {
             break;
@@ -803,9 +862,12 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         let n = dev.rows().len;
         rows_total += n as u64;
         dev.consume(n);
+        count_gpi_edges(&mut dev, &mut edges, &mut last_level);
     }
     let elapsed = start.elapsed().as_secs_f64();
     let after = *dev.counters();
+    // Snapshotted before the stop, which tears the GPI channels down.
+    let gpi = dev.gpi_counters();
     dev.stream_stop().context("stopping the stream")?;
 
     let bytes = after.bytes - before.bytes;
@@ -861,8 +923,66 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         let achieved = real as f64 / elapsed / rate as f64 * 100.0;
         println!("rate achieved       {achieved:.2}% of requested (real samples)");
     }
+    report_gpi(&gpi, &edges, &last_level, elapsed);
     report_health(&after, &dev, &signals, elapsed);
     Ok(())
+}
+
+/// Fold the GPI blocks waiting on the device into a per-channel edge count.
+fn count_gpi_edges(dev: &mut Js220, edges: &mut Vec<(u8, u64)>, last: &mut Vec<(u8, u8)>) {
+    for (channel, blocks) in dev.take_gpi() {
+        for block in blocks {
+            let mut level = last.iter().find(|(c, _)| *c == channel).map(|(_, l)| *l);
+            for bit in block.bits {
+                if level.is_some_and(|l| l != bit) {
+                    match edges.iter_mut().find(|(c, _)| *c == channel) {
+                        Some((_, n)) => *n += 1,
+                        None => edges.push((channel, 1)),
+                    }
+                }
+                level = Some(bit);
+            }
+            if let Some(l) = level {
+                match last.iter_mut().find(|(c, _)| *c == channel) {
+                    Some((_, slot)) => *slot = l,
+                    None => last.push((channel, l)),
+                }
+            }
+        }
+    }
+}
+
+/// Report what each enabled GPI line delivered.
+fn report_gpi(
+    counters: &[(u8, js220::GpiCounters)],
+    edges: &[(u8, u64)],
+    levels: &[(u8, u8)],
+    elapsed: f64,
+) {
+    if counters.is_empty() {
+        return;
+    }
+    println!();
+    for &(channel, c) in counters {
+        let n = edges
+            .iter()
+            .find(|(ch, _)| *ch == channel)
+            .map_or(0, |(_, n)| *n);
+        // Reported for every enabled line, including silent ones: a line that
+        // delivered nothing is the failure most worth seeing.
+        let level = match levels.iter().find(|(ch, _)| *ch == channel) {
+            Some((_, 0)) => "low",
+            Some((_, _)) => "high",
+            None => "no data",
+        };
+        println!(
+            "gpi {channel}               {} samples ({:.0}/s), {n} edges,              last {level}, {} filled, {} discontinuities",
+            c.samples,
+            c.samples as f64 / elapsed,
+            c.filled,
+            c.discontinuities
+        );
+    }
 }
 
 fn report_health(counters: &js220::Counters, dev: &Js220, signals: &[Signal], _elapsed: f64) {
@@ -900,7 +1020,47 @@ mod tests {
             signals: signals.into(),
             current_range: None,
             voltage_range: None,
+            gpi: None,
+            gpio_vref: GpioVrefArg::External,
         }
+    }
+
+    fn gpi_args(list: &str) -> StreamArgs {
+        StreamArgs {
+            gpi: Some(list.into()),
+            ..stream_args("i,v,p", 1_000_000)
+        }
+    }
+
+    #[test]
+    fn no_gpi_flag_asks_for_no_gpi_lines() {
+        assert!(stream_args("i,v,p", 1_000_000).gpi().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gpi_lists_parse_and_deduplicate() {
+        assert_eq!(gpi_args("0,1,7").gpi().unwrap(), vec![0, 1, 7]);
+        assert_eq!(gpi_args("2, 2 ,3").gpi().unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_gpi_list_of_only_separators_is_an_error() {
+        // Silently streaming nothing would be worse than saying so.
+        assert!(gpi_args(" , ").gpi().is_err());
+    }
+
+    #[test]
+    fn a_gpi_channel_that_is_not_a_number_is_an_error() {
+        let err = gpi_args("0,x").gpi().unwrap_err().to_string();
+        assert!(err.contains("x"), "got {err}");
+    }
+
+    #[test]
+    fn a_gpi_channel_the_instrument_lacks_is_rejected_by_the_config() {
+        // Parsing accepts any byte; the device layer owns which exist.
+        let args = gpi_args("4");
+        assert_eq!(args.gpi().unwrap(), vec![4]);
+        assert!(args.config(false, 2.0).is_err());
     }
 
     #[test]

@@ -59,15 +59,17 @@ pub mod decimate;
 pub mod defaults;
 pub mod device;
 pub mod error;
+pub mod gpi;
 pub mod signals;
 pub mod time;
 pub mod usb;
 
 pub use device::{
-    Counters, CurrentRange, Js220, Rows, StreamConfig, VoltageRange, BASE_RATE, MAX_SAMPLE_RATE,
-    MIN_SAMPLE_RATE,
+    Counters, CurrentRange, GpioVref, Js220, Rows, StreamConfig, VoltageRange, BASE_RATE,
+    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
 };
 pub use error::{Error, Result};
+pub use gpi::{GpiBlock, GpiChannel, GpiCounters};
 pub use signals::{Signal, SignalCounters};
 pub use usb::{find, list, DeviceInfo, Mode, TransportConfig};
 
