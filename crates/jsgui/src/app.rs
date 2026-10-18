@@ -502,6 +502,64 @@ impl App {
     }
 }
 
+/// Hold a panned or zoomed view inside the span that actually has data.
+///
+/// Zooming out stops at the whole capture rather than carrying on into empty
+/// time, and panning stops at either end. Widening past what exists simply
+/// shows all of it, which is what "zoom out" is being asked for anyway.
+fn clamp_view(view: (f64, f64), first: f64, last: f64) -> (f64, f64) {
+    let (lo, hi) = view;
+    // A capture with no width, or times that are not comparable, has nothing
+    // to clamp against.
+    if last <= first || !last.is_finite() || !first.is_finite() {
+        return view;
+    }
+    let width = hi - lo;
+    if width >= last - first {
+        return (first, last);
+    }
+    if lo < first {
+        return (first, first + width);
+    }
+    if hi > last {
+        return (last - width, last);
+    }
+    view
+}
+
+/// Where a plot's measurement block goes, and how it is anchored.
+///
+/// With a pair of markers down it sits just right of the span, as the
+/// instrument software does it, so the numbers are next to the region they
+/// describe. When that would run off the right edge it flips to the left of
+/// the span instead, because a block half off screen reads as missing. With
+/// no span it falls back to the top left corner, clear of the axis labels.
+fn stats_anchor(
+    bounds: &egui_plot::PlotBounds,
+    markers: (Option<f64>, Option<f64>),
+) -> (PlotPoint, egui::Align2) {
+    let (lo, hi) = (bounds.min()[0], bounds.max()[0]);
+    let width = hi - lo;
+    let gap = width * 0.008;
+    let top = bounds.max()[1];
+    match markers {
+        (Some(a), Some(b)) => {
+            let right = a.max(b);
+            // Roughly what the block occupies; enough to tell whether it
+            // would be cut off.
+            if right + gap + width * 0.16 <= hi {
+                (PlotPoint::new(right + gap, top), egui::Align2::LEFT_TOP)
+            } else {
+                (PlotPoint::new(a.min(b) - gap, top), egui::Align2::RIGHT_TOP)
+            }
+        }
+        _ => (
+            PlotPoint::new(lo + width * 0.012, top),
+            egui::Align2::LEFT_TOP,
+        ),
+    }
+}
+
 /// The measurements reported for a marker span, in the order shown.
 #[allow(clippy::type_complexity)]
 const FIELDS: &[(&str, fn(&RangeStats) -> f64)] = &[
@@ -557,9 +615,15 @@ impl eframe::App for App {
         let snapshot = self.acq.shared().clone();
         let shared = snapshot.lock().expect("shared snapshot poisoned");
 
+        // Delete clears the markers from anywhere, so there is never a
+        // question of which button does it.
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.marker_a = None;
+            self.marker_b = None;
+        }
+
         self.toolbar(ctx, &shared);
         self.status_bar(ctx, &shared);
-        self.marker_panel(ctx, &shared);
         if self.show_log {
             self.log_panel(ctx, &shared);
         }
@@ -735,7 +799,11 @@ impl App {
                         self.place_single(t);
                     }
                 }
-                if ui.button("✖").on_hover_text("Remove the markers").clicked() {
+                if ui
+                    .button("✖")
+                    .on_hover_text("Remove the markers (or press Delete)")
+                    .clicked()
+                {
                     self.marker_a = None;
                     self.marker_b = None;
                 }
@@ -743,10 +811,14 @@ impl App {
                 ui.separator();
                 if ui
                     .button("Clear")
-                    .on_hover_text("Discard the captured history")
+                    .on_hover_text(
+                        "Discard the captured history. The markers go with it, since they would be left pointing at data that no longer exists.",
+                    )
                     .clicked()
                 {
                     self.acq.send(Command::ClearTraces);
+                    self.marker_a = None;
+                    self.marker_b = None;
                 }
 
                 ui.separator();
@@ -885,122 +957,6 @@ impl App {
         });
     }
 
-    /// Measurements across the marker span, as a table.
-    ///
-    /// The per-plot overlay says what one signal is doing; this says what
-    /// every signal is doing at once, which is the question a pair of markers
-    /// is usually asked. Shown only when there is a span to measure.
-    fn marker_panel(&mut self, ctx: &egui::Context, shared: &Shared) {
-        let Some((a, b)) = self.export_range(ExportSpan::Markers) else {
-            return;
-        };
-        let dt = b - a;
-        let views = views_for(shared.source, (0, 1));
-        let coarse = [&shared.current, &shared.voltage, &shared.power];
-        let raw = [&shared.raw_current, &shared.raw_voltage, &shared.raw_power];
-
-        // Gathered first so the table is laid out from what actually exists.
-        let mut columns: Vec<(&SignalView, RangeStats)> = Vec::new();
-        for (i, view) in views.iter().enumerate() {
-            if !self.visible[i] {
-                continue;
-            }
-            if let Some(stats) = span_stats(raw[i], coarse[i], a, b) {
-                columns.push((view, stats));
-            }
-        }
-
-        egui::TopBottomPanel::bottom("marker_stats").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(MARKER_A, "A");
-                ui.weak(fmt::clock(a));
-                ui.colored_label(MARKER_B, "B");
-                ui.weak(fmt::clock(b));
-                ui.separator();
-                ui.strong(format!("Δt {}", fmt::si(dt, "s")));
-                if dt > 0.0 {
-                    // The rate a repeating feature would have, which is what
-                    // the span is measuring whenever it brackets one period.
-                    ui.label(format!("1/Δt {}", fmt::si(1.0 / dt, "Hz")));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("✖")
-                        .on_hover_text("Clear markers")
-                        .clicked()
-                    {
-                        self.marker_a = None;
-                        self.marker_b = None;
-                    }
-                });
-            });
-
-            if columns.is_empty() {
-                ui.weak("No samples in that span");
-                ui.add_space(2.0);
-                return;
-            }
-
-            egui::Grid::new("marker_stats_grid")
-                .striped(true)
-                .num_columns(columns.len() + 1)
-                .show(ui, |ui| {
-                    ui.label("");
-                    for (view, _) in &columns {
-                        ui.colored_label(view.colour, egui::RichText::new(view.name).strong());
-                    }
-                    ui.end_row();
-
-                    for (name, pick) in FIELDS {
-                        ui.weak(*name);
-                        for (view, stats) in &columns {
-                            ui.label(fmt::si(pick(stats), view.unit));
-                        }
-                        ui.end_row();
-                    }
-
-                    // Charge and energy, where the integral means something.
-                    // Voltage gets a dash rather than a number nobody asked
-                    // for.
-                    ui.weak("∫");
-                    for (view, stats) in &columns {
-                        match view.integral_unit {
-                            Some(unit) => {
-                                ui.label(fmt::si(stats.mean as f64 * dt, unit));
-                            }
-                            None => {
-                                ui.weak("—");
-                            }
-                        }
-                    }
-                    ui.end_row();
-                });
-
-            // Logic lines summarised on one line: a level has no average
-            // worth printing, but how long it was high does.
-            let logic: Vec<String> = shared
-                .gpi
-                .iter()
-                .filter(|t| self.gpi_shown(t.channel))
-                .filter_map(|t| {
-                    let mut buckets = Vec::new();
-                    aggregate_for_view(&t.raw, &t.coarse, (a, b), 512, &mut buckets);
-                    logic_summary(&buckets, (a, b)).map(|s| format!("{}: {s}", gpi_name(t.channel)))
-                })
-                .collect();
-            if !logic.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    for line in logic {
-                        ui.colored_label(LOGIC, line);
-                        ui.separator();
-                    }
-                });
-            }
-            ui.add_space(2.0);
-        });
-    }
-
     fn status_bar(&mut self, ctx: &egui::Context, shared: &Shared) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1064,6 +1020,20 @@ impl App {
                         format!("⏺ {} rows", fmt::count(shared.recorded_rows as f64)),
                     );
                     ui.weak(p.display().to_string());
+                }
+                if let Some((a, b)) = self.export_range(ExportSpan::Markers) {
+                    ui.separator();
+                    let dt = b - a;
+                    ui.colored_label(MARKER_A, "A");
+                    ui.weak(fmt::clock(a));
+                    ui.colored_label(MARKER_B, "B");
+                    ui.weak(fmt::clock(b));
+                    ui.strong(format!("Δt {}", fmt::si(dt, "s")));
+                    if dt > 0.0 {
+                        // The rate a repeating feature would have, which is
+                        // what the span measures whenever it brackets one.
+                        ui.label(format!("1/Δt {}", fmt::si(1.0 / dt, "Hz")));
+                    }
                 }
                 if let Some(message) = self.export_status.clone() {
                     ui.separator();
@@ -1208,6 +1178,7 @@ impl App {
                     (self.marker_a, self.marker_b),
                     self.dragging,
                     analysis,
+                    Some(&i) == shown.first(),
                 );
                 if let Some(t) = outcome.hover_t {
                     self.hover_t = Some(t);
@@ -1334,9 +1305,14 @@ impl App {
         };
         if !self.follow.iter().any(|f| *f) {
             if let Some((lo, hi)) = self.view_x {
-                // Still overlapping the retained data: honour it.
+                // Still overlapping the retained data: honour it, held
+                // inside the capture. Zooming out used to run off the front
+                // of it and show half a screen of time before the capture
+                // began, which can never hold anything.
                 if hi >= first && lo <= last {
-                    return (lo, hi);
+                    let held = clamp_view((lo, hi), first, last);
+                    self.view_x = Some(held);
+                    return held;
                 }
                 self.follow = [true; VIEWS.len()];
             }
@@ -1472,6 +1448,7 @@ fn plot_signal(
     markers: (Option<f64>, Option<f64>),
     dragging: Option<Grab>,
     analysis: Analysis,
+    span_label: bool,
 ) -> (PlotOutcome, egui::Response) {
     let unit = view.unit;
     let plot = Plot::new(view.name)
@@ -1490,9 +1467,9 @@ fn plot_signal(
         .custom_x_axes(vec![
             AxisHints::new_x().formatter(|mark, _range| fmt::clock(mark.value))
         ])
-        .custom_y_axes(vec![
-            AxisHints::new_y().formatter(move |mark, _range| fmt::si_tick(mark.value, unit))
-        ])
+        .custom_y_axes(vec![AxisHints::new_y()
+            .min_thickness(Y_GUTTER)
+            .formatter(move |mark, _range| fmt::si_tick(mark.value, unit))])
         .label_formatter(move |name, value| {
             if name.is_empty() {
                 format!("{}\n{}", fmt::clock(value.x), fmt::si(value.y, unit))
@@ -1644,6 +1621,18 @@ fn plot_signal(
                 .fill_color(egui::Color32::from_rgba_unmultiplied(80, 150, 90, 38))
                 .stroke(egui::Stroke::NONE),
             );
+            // Once, on the topmost plot: the span is the same in all of them,
+            // and repeating it in each would be noise.
+            if span_label {
+                plot_ui.text(
+                    Text::new(
+                        PlotPoint::new((lo + hi) * 0.5, bounds.max()[1]),
+                        fmt::si(hi - lo, "s"),
+                    )
+                    .anchor(egui::Align2::CENTER_TOP)
+                    .color(egui::Color32::from_gray(225)),
+                );
+            }
         }
         for (t, name, colour) in [(markers.0, "A", MARKER_A), (markers.1, "B", MARKER_B)] {
             let Some(t) = t else { continue };
@@ -1660,26 +1649,23 @@ fn plot_signal(
             }
         }
 
-        // With both markers down the panel below carries these numbers for
-        // every signal at once, so repeating them here would only cover the
-        // trace they describe.
+        // Measurements sit beside the span they describe, inside the plot
+        // and in this signal's own units, which is where the instrument
+        // software puts them and where the eye already is. A bottom panel
+        // was tried and is worse: it puts the numbers a long way from the
+        // region they belong to.
         let (stats_span, label) = match markers {
-            (Some(_), Some(_)) => (None, String::new()),
+            (Some(a), Some(b)) => (Some((a.min(b), a.max(b))), String::new()),
             (Some(a), None) => (Some((x.0, a)), "view → A".to_string()),
             _ => (Some((x.0, x.1)), "view".to_string()),
         };
         if let Some((a, b)) = stats_span {
             if let Some(stats) = span_stats(raw, coarse, a, b) {
                 let text = stats_block(&label, &stats, view, (b - a).abs());
-                // Inset far enough to clear the Y axis labels, which egui
-                // draws inside the plot area.
-                let pos = PlotPoint::new(
-                    bounds.min()[0] + (bounds.max()[0] - bounds.min()[0]) * 0.055,
-                    bounds.max()[1],
-                );
+                let (pos, align) = stats_anchor(&bounds, markers);
                 plot_ui.text(
                     Text::new(pos, text)
-                        .anchor(egui::Align2::LEFT_TOP)
+                        .anchor(align)
                         .color(egui::Color32::from_gray(205)),
                 );
             }
@@ -1692,6 +1678,15 @@ fn plot_signal(
 
 /// Colour of a logic trace.
 const LOGIC: egui::Color32 = egui::Color32::from_rgb(140, 230, 170);
+
+/// Width reserved for the Y axis on every plot, in points.
+///
+/// Fixed rather than fitted to the labels. egui_plot sizes the gutter from
+/// the text it is about to draw, so "600 mA" reserved more room than "5 V"
+/// and each plot's data area started at a different x — which put the same
+/// instant at a different place on screen in each one, and made a marker
+/// span visibly lean. A shared time axis is only shared if it lines up.
+const Y_GUTTER: f32 = 58.0;
 
 /// Y range a logic plot draws in, leaving room above and below the two levels.
 const LOGIC_Y: (f64, f64) = (-0.2, 1.2);
@@ -1717,7 +1712,14 @@ fn plot_logic(
     let name = gpi_name(channel);
     let plot = Plot::new(format!("gpi{channel}"))
         .height(height.max(24.0))
-        .show_axes([false, false])
+        // The Y axis is drawn only to reserve the same gutter the waveforms
+        // have: without it the logic rows start further left and the markers
+        // no longer line up with the traces they explain. Two levels need no
+        // tick labels, so it carries none.
+        .show_axes([false, true])
+        .custom_y_axes(vec![AxisHints::new_y()
+            .min_thickness(Y_GUTTER)
+            .formatter(|_, _| String::new())])
         .show_grid([true, false])
         .allow_zoom(false)
         .allow_scroll(false)
@@ -2068,16 +2070,13 @@ fn y_bounds(buckets: &[Bucket]) -> (f64, f64) {
 /// The statistics block drawn inside the plot, mirroring the fields the
 /// instrument's own software reports.
 fn stats_block(label: &str, s: &RangeStats, view: &SignalView, dt: f64) -> String {
-    let mut text = format!("{label}\n");
-    for (name, value) in [
-        ("avg", s.mean as f64),
-        ("std", s.std as f64),
-        ("rms", s.rms as f64),
-        ("min", s.min as f64),
-        ("max", s.max as f64),
-        ("p2p", s.p2p() as f64),
-    ] {
-        text.push_str(&format!("{name} {}\n", fmt::si(value, view.unit)));
+    let mut text = String::new();
+    if !label.is_empty() {
+        text.push_str(label);
+        text.push('\n');
+    }
+    for (name, read) in FIELDS {
+        text.push_str(&format!("{name} {}\n", fmt::si(read(s), view.unit)));
     }
     if let Some(unit) = view.integral_unit {
         text.push_str(&format!("∫   {}", fmt::si(s.mean as f64 * dt, unit)));
@@ -2516,6 +2515,81 @@ mod tests {
                 mean: (min + max) / 2.0,
             })
             .collect()
+    }
+
+    fn bounds(lo: f64, hi: f64) -> egui_plot::PlotBounds {
+        egui_plot::PlotBounds::from_min_max([lo, 0.0], [hi, 1.0])
+    }
+
+    #[test]
+    fn a_view_inside_the_capture_is_left_alone() {
+        assert_eq!(clamp_view((5.0, 10.0), 0.0, 20.0), (5.0, 10.0));
+    }
+
+    #[test]
+    fn zooming_out_stops_at_the_whole_capture() {
+        // Not half a screen of time from before the capture began.
+        assert_eq!(clamp_view((-30.0, 50.0), 0.0, 20.0), (0.0, 20.0));
+    }
+
+    #[test]
+    fn panning_off_the_front_slides_back_keeping_its_width() {
+        let (lo, hi) = clamp_view((-5.0, 5.0), 0.0, 20.0);
+        assert_eq!((lo, hi), (0.0, 10.0));
+    }
+
+    #[test]
+    fn panning_off_the_end_slides_back_keeping_its_width() {
+        let (lo, hi) = clamp_view((18.0, 28.0), 0.0, 20.0);
+        assert_eq!((lo, hi), (10.0, 20.0));
+    }
+
+    #[test]
+    fn a_capture_with_no_width_is_left_alone() {
+        // Nothing to clamp against before the first samples land.
+        assert_eq!(clamp_view((1.0, 2.0), 5.0, 5.0), (1.0, 2.0));
+    }
+
+    #[test]
+    fn measurements_sit_to_the_right_of_the_span() {
+        // Beside the region they describe, as the instrument software does.
+        let b = bounds(0.0, 100.0);
+        let (pos, align) = stats_anchor(&b, (Some(10.0), Some(20.0)));
+        assert_eq!(align, egui::Align2::LEFT_TOP);
+        assert!(pos.x > 20.0, "placed at {}", pos.x);
+        assert_eq!(pos.y, 1.0, "aligned to the top of the plot");
+    }
+
+    #[test]
+    fn measurements_flip_left_rather_than_run_off_the_edge() {
+        // A span ending at the right edge leaves no room on that side, and a
+        // block half off screen reads as missing.
+        let b = bounds(0.0, 100.0);
+        let (pos, align) = stats_anchor(&b, (Some(80.0), Some(99.0)));
+        assert_eq!(align, egui::Align2::RIGHT_TOP);
+        assert!(pos.x < 80.0, "placed at {}", pos.x);
+    }
+
+    #[test]
+    fn marker_order_does_not_move_the_measurements() {
+        let b = bounds(0.0, 100.0);
+        let forward = stats_anchor(&b, (Some(10.0), Some(20.0)));
+        let reversed = stats_anchor(&b, (Some(20.0), Some(10.0)));
+        assert_eq!(forward.0.x, reversed.0.x);
+        assert_eq!(forward.1, reversed.1);
+    }
+
+    #[test]
+    fn without_a_span_the_measurements_go_top_left() {
+        let b = bounds(0.0, 100.0);
+        let (pos, align) = stats_anchor(&b, (None, None));
+        assert_eq!(align, egui::Align2::LEFT_TOP);
+        assert!(pos.x > 0.0 && pos.x < 5.0, "clear of the axis: {}", pos.x);
+        // A single marker has no span, so it reads like no span at all.
+        assert_eq!(
+            stats_anchor(&b, (Some(50.0), None)).1,
+            egui::Align2::LEFT_TOP
+        );
     }
 
     #[test]
