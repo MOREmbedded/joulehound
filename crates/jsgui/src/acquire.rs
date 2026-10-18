@@ -68,8 +68,15 @@ pub enum Command {
         /// What those lines compare against.
         gpio_vref: GpioVref,
     },
-    /// Stop streaming and close the device.
+    /// Stop streaming, leaving the device open and the target powered.
     Stop,
+    /// Release the device entirely.
+    Disconnect,
+    /// Change which general purpose inputs are captured, mid-capture.
+    SetGpi {
+        /// The lines to capture from now on.
+        channels: Vec<u8>,
+    },
     /// Discard the displayed history.
     ClearTraces,
     /// Open or close the current path to the target.
@@ -95,6 +102,8 @@ pub enum Status {
     Idle,
     /// Opening and configuring.
     Connecting,
+    /// Device open and holding the target's supply, but not streaming.
+    Open,
     /// Streaming.
     Running,
     /// Stopped after an error.
@@ -108,6 +117,7 @@ impl Status {
             Self::Idle => "idle",
             Self::Connecting => "connecting",
             Self::Running => "running",
+            Self::Open => "connected",
             Self::Failed(_) => "error",
         }
     }
@@ -338,8 +348,16 @@ impl Drop for Acquisition {
 }
 
 /// Per-session state while a device is open.
+///
+/// The device is kept open across stop and start. Closing it would cut power
+/// to the target: the instrument's own defaults leave the current range mode
+/// off, which opens the ranging path the target sits in series with, and
+/// every open restores those defaults. Reopening also costs seconds.
 struct Session {
     device: Js220,
+    /// Whether the instrument is currently streaming. False means the device
+    /// is open and idle, not closed.
+    streaming: bool,
     rate: u32,
     sample_period: f64,
     /// Index of the next sample, counted from capture start.
@@ -379,7 +397,9 @@ fn run(rx: Receiver<Command>, shared: Arc<Mutex<Shared>>, running: Arc<AtomicBoo
             }
         }
 
-        let Some(active) = session.as_mut() else {
+        // An open but idle device is left alone; it is held so that starting
+        // again is immediate and does not disturb the target.
+        let Some(active) = session.as_mut().filter(|s| s.streaming) else {
             // Nothing to do; sleep briefly rather than spin.
             std::thread::sleep(Duration::from_millis(20));
             continue;
@@ -426,11 +446,40 @@ fn handle_command(
                 s.filled = 0;
                 s.elapsed = 0.0;
             }
-            match start_session(serial.as_deref(), source, rate, statistics, &gpi, gpio_vref) {
-                Ok(new) => {
+            // An already-open device is reused rather than reopened. Closing
+            // and reopening takes seconds and, because the instrument's
+            // defaults leave the current path open, interrupts the target's
+            // supply — so pressing Stop and Start would reset whatever is
+            // being measured.
+            let wanted = serial.as_deref();
+            let reusable = session
+                .as_ref()
+                .is_some_and(|s| wanted.map_or(true, |w| s.device.serial() == w));
+            if !reusable {
+                // A different device was asked for; let go of this one.
+                *session = None;
+            }
+
+            let outcome = match session.as_mut() {
+                Some(open) => begin_stream(open, source, rate, statistics, &gpi, gpio_vref),
+                None => match open_session(wanted) {
+                    Ok(mut fresh) => {
+                        let r = begin_stream(&mut fresh, source, rate, statistics, &gpi, gpio_vref);
+                        if r.is_ok() {
+                            *session = Some(fresh);
+                        }
+                        r
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+
+            match outcome {
+                Ok(()) => {
+                    let open = session.as_ref().expect("set on success");
                     let mut s = shared.lock().expect("shared snapshot poisoned");
-                    s.serial = Some(new.device.serial().to_owned());
-                    let info = new.device.connect_info();
+                    s.serial = Some(open.device.serial().to_owned());
+                    let info = open.device.connect_info();
                     s.versions = Some(format!(
                         "fw {} · hw {} · fpga {}",
                         info.fw_version, info.hw_version, info.fpga_version
@@ -447,21 +496,74 @@ fn handle_command(
                     s.reconfigure_raw(1.0 / effective.max(1) as f64);
                     s.status = Status::Running;
                     s.push_log(LogLevel::Info, format!("streaming at {rate} Hz"), started);
-                    *session = Some(new);
                 }
                 Err(e) => {
+                    // A device that failed to configure is not trustworthy;
+                    // let go of it so the next attempt starts clean.
+                    *session = None;
                     let mut s = shared.lock().expect("shared snapshot poisoned");
-                    s.push_log(LogLevel::Error, format!("open failed: {e}"), started);
+                    s.push_log(LogLevel::Error, format!("start failed: {e}"), started);
                     s.status = Status::Failed(e.to_string());
                 }
             }
         }
         Command::Stop => {
+            // The ports are closed but the device stays open, so the target
+            // keeps its supply and starting again is immediate.
+            if let Some(open) = session.as_mut() {
+                open.streaming = false;
+                open.recorder = None;
+                if let Err(e) = open.device.stream_stop() {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.push_log(LogLevel::Warn, format!("stop reported {e}"), started);
+                }
+            }
+            let mut s = shared.lock().expect("shared snapshot poisoned");
+            s.status = Status::Open;
+            s.recording = None;
+            s.push_log(LogLevel::Info, "stopped; device still open", started);
+        }
+        Command::Disconnect => {
+            // Explicitly letting go of the device, which does disturb the
+            // target: the instrument reverts to its own defaults, and those
+            // leave the current path open.
             *session = None;
             let mut s = shared.lock().expect("shared snapshot poisoned");
             s.status = Status::Idle;
             s.recording = None;
-            s.push_log(LogLevel::Info, "stopped", started);
+            s.serial = None;
+            s.versions = None;
+            s.push_log(LogLevel::Info, "disconnected", started);
+        }
+        Command::SetGpi { channels } => {
+            let Some(open) = session.as_mut() else {
+                // Nothing open: the selection is applied when streaming
+                // starts, so there is nothing to do and nothing to warn about.
+                return;
+            };
+            match open.device.set_gpi(&channels) {
+                Ok(()) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    // Lines that stay keep the samples they have; only the
+                    // ones added or dropped change.
+                    s.gpi.retain(|t| channels.contains(&t.channel));
+                    for &c in &channels {
+                        if !s.gpi.iter().any(|t| t.channel == c) {
+                            s.gpi.push(GpiTrace::new(c, BUCKETS));
+                        }
+                    }
+                    s.gpi.sort_by_key(|t| t.channel);
+                    s.push_log(
+                        LogLevel::Info,
+                        format!("capturing GPI {channels:?}"),
+                        started,
+                    );
+                }
+                Err(e) => {
+                    let mut s = shared.lock().expect("shared snapshot poisoned");
+                    s.push_log(LogLevel::Error, format!("GPI change failed: {e}"), started);
+                }
+            }
         }
         Command::ClearTraces => {
             let mut s = shared.lock().expect("shared snapshot poisoned");
@@ -566,25 +668,13 @@ fn bucket_seconds_for(rate: u32) -> f64 {
     HISTORY_BUCKET_SECONDS.max(sample_period)
 }
 
-fn start_session(
-    serial: Option<&str>,
-    source: Source,
-    rate: u32,
-    statistics: bool,
-    gpi: &[u8],
-    gpio_vref: GpioVref,
-) -> js220::Result<Session> {
-    let device = Js220::open_with(serial, TransportConfig::default())?;
-    // Raw ADC runs at its own fixed rate; the selector only governs the
-    // calibrated path.
-    let effective = match source {
-        Source::RawAdc => js220::BASE_RATE,
-        Source::Calibrated => rate,
-    };
-    let mut session = Session {
-        device,
-        rate: effective,
-        sample_period: 1.0 / effective as f64,
+/// Open a device and hold it idle.
+fn open_session(serial: Option<&str>) -> js220::Result<Session> {
+    Ok(Session {
+        device: Js220::open_with(serial, TransportConfig::default())?,
+        streaming: false,
+        rate: js220::MAX_SAMPLE_RATE,
+        sample_period: 1.0 / js220::MAX_SAMPLE_RATE as f64,
         next_index: 0,
         id0: None,
         gpi_levels: Vec::new(),
@@ -593,6 +683,23 @@ fn start_session(
         last_bytes: 0,
         last_samples: 0,
         recorder: None,
+    })
+}
+
+/// Configure an already-open device and begin streaming.
+fn begin_stream(
+    session: &mut Session,
+    source: Source,
+    rate: u32,
+    statistics: bool,
+    gpi: &[u8],
+    gpio_vref: GpioVref,
+) -> js220::Result<()> {
+    // Raw ADC runs at its own fixed rate; the selector only governs the
+    // calibrated path.
+    let effective = match source {
+        Source::RawAdc => js220::BASE_RATE,
+        Source::Calibrated => rate,
     };
     let cfg = StreamConfig {
         source,
@@ -605,9 +712,19 @@ fn start_session(
         ..Default::default()
     };
     session.device.stream_start(cfg)?;
+
+    // The time axis restarts with the capture, so everything counted from it
+    // restarts too.
+    session.rate = effective;
+    session.sample_period = 1.0 / effective as f64;
+    session.next_index = 0;
+    session.id0 = None;
     session.started = Instant::now();
     session.last_stats = Instant::now();
-    Ok(session)
+    session.last_bytes = session.device.counters().bytes;
+    session.last_samples = 0;
+    session.streaming = true;
+    Ok(())
 }
 
 fn pump(session: &mut Session, shared: &Arc<Mutex<Shared>>, started: Instant) -> js220::Result<()> {

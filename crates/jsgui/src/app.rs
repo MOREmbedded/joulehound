@@ -185,10 +185,19 @@ pub struct App {
     /// would leave a trace whose history covers a different set of lines
     /// than its tail.
     gpi_enabled: [bool; js220::proto::stream::GPI_CHANNELS.len()],
+    /// Which captured lines are drawn. Separate from capture, so hiding a
+    /// row costs nothing and loses nothing.
+    gpi_visible: [bool; js220::proto::stream::GPI_CHANNELS.len()],
     /// What the inputs compare against.
     gpio_vref: GpioVref,
     /// Height of each logic plot, which needs far less room than a waveform.
     gpi_height: f32,
+    /// Time under the pointer on whichever plot it is over, so markers can be
+    /// placed where you are looking rather than at a fixed fraction of the
+    /// view.
+    hover_t: Option<f64>,
+    /// Time the marker context menu was opened at.
+    menu_t: Option<f64>,
 }
 
 /// Which span an export covers.
@@ -258,18 +267,29 @@ impl App {
             export_rows: 20_000,
             export_status: None,
             gpi_enabled: gpi_selection(gpi.as_deref()),
+            gpi_visible: [true; js220::proto::stream::GPI_CHANNELS.len()],
             gpio_vref: if vref_3v3 {
                 GpioVref::V3p3
             } else {
                 GpioVref::External
             },
             gpi_height: 46.0,
+            hover_t: None,
+            menu_t: None,
         };
         app.rescan();
         if autostart && app.serial.is_some() {
             app.acq.send(app.start_command());
         }
         app
+    }
+
+    /// Whether a captured line is drawn.
+    fn gpi_shown(&self, channel: u8) -> bool {
+        js220::proto::stream::GPI_CHANNELS
+            .iter()
+            .position(|c| *c == channel)
+            .is_some_and(|i| self.gpi_visible[i])
     }
 
     /// The general purpose input channels currently selected.
@@ -306,6 +326,17 @@ impl App {
 
     fn running(&self, shared: &Shared) -> bool {
         matches!(shared.status, Status::Running | Status::Connecting)
+    }
+
+    /// Whether a device is open, whether or not it is streaming.
+    ///
+    /// An open device holds the target's supply, so controls that act on the
+    /// instrument stay available after Stop.
+    fn connected(&self, shared: &Shared) -> bool {
+        matches!(
+            shared.status,
+            Status::Running | Status::Connecting | Status::Open
+        )
     }
 
     /// The time span an export would cover, if there is one.
@@ -345,7 +376,7 @@ impl App {
         }
         // Logic lines go in the same file, on the same time axis: lining an
         // edge up against a current step is the whole reason to capture both.
-        for line in &shared.gpi {
+        for line in shared.gpi.iter().filter(|t| self.gpi_shown(t.channel)) {
             let mut buckets = Vec::new();
             aggregate_for_view(
                 &line.raw,
@@ -390,12 +421,99 @@ impl App {
         });
     }
 
-    /// Place both markers around the middle of the current view.
-    fn place_markers(&mut self) {
-        let Some((lo, hi)) = self.view_x else { return };
-        let span = hi - lo;
-        self.marker_a = Some(lo + span * 0.35);
-        self.marker_b = Some(lo + span * 0.65);
+    /// Where a marker should go when no particular time was named: under the
+    /// pointer if it is over a plot, otherwise the middle of what is drawn.
+    ///
+    /// This used to read `view_x`, which is only set once the view has been
+    /// panned or zoomed. On a fresh capture it is `None`, so the marker
+    /// buttons silently did nothing at all until you happened to drag the
+    /// plot first.
+    fn marker_default(&self) -> Option<f64> {
+        marker_default(self.hover_t, self.drawn_x)
+    }
+
+    /// Place a pair of markers around `t`, spanning a tenth of the view.
+    fn place_pair(&mut self, t: f64) {
+        let span = self.drawn_x.map_or(1.0, |(lo, hi)| (hi - lo) * 0.05);
+        self.marker_a = Some(t - span);
+        self.marker_b = Some(t + span);
+    }
+
+    /// Place a single marker at `t`, dropping any second one.
+    fn place_single(&mut self, t: f64) {
+        self.marker_a = Some(t);
+        self.marker_b = None;
+    }
+
+    /// Marker actions, offered by right-clicking any plot.
+    fn marker_menu(&mut self, ui: &mut egui::Ui) {
+        let t = self.menu_t;
+        let here = |t: Option<f64>| match t {
+            Some(t) => format!(" at {}", fmt::clock(t)),
+            None => String::new(),
+        };
+        ui.label(egui::RichText::new(format!("Markers{}", here(t))).strong());
+        if ui
+            .add_enabled(t.is_some(), egui::Button::new("Pair here"))
+            .clicked()
+        {
+            if let Some(t) = t {
+                self.place_pair(t);
+            }
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(t.is_some(), egui::Button::new("Single marker here"))
+            .clicked()
+        {
+            if let Some(t) = t {
+                self.place_single(t);
+            }
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(t.is_some(), egui::Button::new("Move A here"))
+            .clicked()
+        {
+            self.marker_a = t;
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(t.is_some(), egui::Button::new("Move B here"))
+            .clicked()
+        {
+            self.marker_b = t;
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                self.marker_a.is_some() || self.marker_b.is_some(),
+                egui::Button::new("Clear markers"),
+            )
+            .clicked()
+        {
+            self.marker_a = None;
+            self.marker_b = None;
+            ui.close_menu();
+        }
+    }
+}
+
+/// Where a marker goes when no particular time was named.
+///
+/// The pointer wins when it is over the drawn range. It is deliberately not
+/// cleared when the pointer leaves a plot: reaching the toolbar means moving
+/// off the plot, and a button that disabled itself on the way to being
+/// clicked would be useless. A remembered position that has since scrolled
+/// out of view is dropped, since placing a marker there would put it
+/// somewhere nobody can see.
+fn marker_default(hover: Option<f64>, drawn: Option<(f64, f64)>) -> Option<f64> {
+    let (lo, hi) = drawn?;
+    match hover {
+        Some(t) if t >= lo && t <= hi => Some(t),
+        _ => Some(lo + (hi - lo) * 0.5),
     }
 }
 
@@ -477,11 +595,24 @@ impl App {
                     if ui.button("⏹ Stop").clicked() {
                         self.acq.send(Command::Stop);
                     }
-                } else if ui
-                    .add_enabled(self.serial.is_some(), egui::Button::new("▶ Start"))
-                    .clicked()
-                {
-                    self.acq.send(self.start_command());
+                } else {
+                    if ui
+                        .add_enabled(self.serial.is_some(), egui::Button::new("▶ Start"))
+                        .clicked()
+                    {
+                        self.acq.send(self.start_command());
+                    }
+                    // Stopping leaves the device open so the target keeps its
+                    // supply; this is how you let go of it deliberately.
+                    if ui
+                        .add_enabled(self.connected(shared), egui::Button::new("⏏"))
+                        .on_hover_text(
+                            "Release the instrument. The target loses power: the JS220 reverts to its own defaults on disconnect, and those open the current path.",
+                        )
+                        .clicked()
+                    {
+                        self.acq.send(Command::Disconnect);
+                    }
                 }
 
                 ui.separator();
@@ -570,17 +701,25 @@ impl App {
 
                 ui.separator();
                 ui.label("Markers:");
+                let at = self.marker_default();
                 if ui
-                    .button("A|B")
-                    .on_hover_text("Place a pair of markers; drag them in the plot")
+                    .add_enabled(at.is_some(), egui::Button::new("A|B"))
+                    .on_hover_text(
+                        "Place a pair around the pointer, or the middle of the view. Drag them in any plot; right-click a plot for more.",
+                    )
                     .clicked()
                 {
-                    self.place_markers();
+                    if let Some(t) = at {
+                        self.place_pair(t);
+                    }
                 }
-                if ui.button("A").on_hover_text("Place a single marker").clicked() {
-                    if let Some((lo, hi)) = self.view_x {
-                        self.marker_a = Some(lo + (hi - lo) * 0.5);
-                        self.marker_b = None;
+                if ui
+                    .add_enabled(at.is_some(), egui::Button::new("A"))
+                    .on_hover_text("Place a single marker under the pointer")
+                    .clicked()
+                {
+                    if let Some(t) = at {
+                        self.place_single(t);
                     }
                 }
                 if ui.button("✖").on_hover_text("Remove the markers").clicked() {
@@ -598,20 +737,21 @@ impl App {
                 }
 
                 ui.separator();
-                // Enabled as part of the stream configuration, so the choice
-                // is locked while a capture is running.
-                ui.add_enabled_ui(!running, |ui| {
-                    ui.menu_button("Logic", |ui| {
-                        ui.label("Capture these inputs:");
-                        for (i, channel) in js220::proto::stream::GPI_CHANNELS.iter().enumerate() {
-                            let label = if *channel == 7 {
-                                "IN 7 (trigger)".to_string()
-                            } else {
-                                format!("IN {channel}")
-                            };
-                            ui.checkbox(&mut self.gpi_enabled[i], label);
-                        }
-                        ui.separator();
+                let before = self.gpi_enabled;
+                ui.menu_button("Logic", |ui| {
+                    ui.label("Capture these inputs:");
+                    for (i, channel) in js220::proto::stream::GPI_CHANNELS.iter().enumerate() {
+                        let label = if *channel == 7 {
+                            "IN 7 (trigger)".to_string()
+                        } else {
+                            format!("IN {channel}")
+                        };
+                        ui.checkbox(&mut self.gpi_enabled[i], label);
+                    }
+                    ui.separator();
+                    // Changing this mid-capture would restart the stream, so
+                    // it is the one setting here that waits.
+                    ui.add_enabled_ui(!running, |ui| {
                         ui.label("Compare against:");
                         ui.radio_value(&mut self.gpio_vref, GpioVref::External, "External Vref")
                             .on_hover_text(
@@ -619,11 +759,31 @@ impl App {
                             );
                         ui.radio_value(&mut self.gpio_vref, GpioVref::V3p3, "3.3 V")
                             .on_hover_text("The instrument supplies the reference itself");
-                        ui.separator();
-                        ui.weak("Applied when streaming starts");
                     });
+                    if running {
+                        ui.weak("Vref applies on the next start");
+                    }
                 });
-                if !self.gpi_channels().is_empty() {
+                if self.gpi_enabled != before && running {
+                    // The GPI ports are independent of the analog ones, so
+                    // this takes effect immediately and the capture so far
+                    // is kept.
+                    self.acq.send(Command::SetGpi {
+                        channels: self.gpi_channels(),
+                    });
+                }
+                // Show and hide, which is not the same as capture: a hidden
+                // line keeps recording, so it is still there when you want
+                // to look at it.
+                for (i, channel) in js220::proto::stream::GPI_CHANNELS.iter().enumerate() {
+                    if !self.gpi_enabled[i] {
+                        continue;
+                    }
+                    let label = egui::RichText::new(format!("{channel}")).color(LOGIC);
+                    ui.toggle_value(&mut self.gpi_visible[i], label)
+                        .on_hover_text(format!("Show {}", gpi_name(*channel)));
+                }
+                if self.gpi_enabled.iter().any(|v| *v) {
                     ui.add(
                         egui::DragValue::new(&mut self.gpi_height)
                             .range(24.0..=160.0)
@@ -697,7 +857,7 @@ impl App {
                 };
                 let button = egui::Button::new(egui::RichText::new(label).color(colour).strong());
                 if ui
-                    .add_enabled(running, button)
+                    .add_enabled(self.connected(shared), button)
                     .on_hover_text(
                         "Open or close the current path through the instrument. The JS220 sits in series with the target, so opening it should cut the target's supply and reset it — confirm at the target, not from the current reading, which measures nothing once the path is open.",
                     )
@@ -717,6 +877,10 @@ impl App {
             ui.horizontal(|ui| {
                 let (text, colour) = match &shared.status {
                     Status::Idle => ("idle".to_string(), egui::Color32::GRAY),
+                    Status::Open => (
+                        "connected".to_string(),
+                        egui::Color32::from_rgb(140, 200, 255),
+                    ),
                     Status::Connecting => (
                         "connecting…".to_string(),
                         egui::Color32::from_rgb(230, 200, 90),
@@ -831,7 +995,12 @@ impl App {
             // Logic rows take a fixed slice off the top of the budget; the
             // waveforms divide what is left. Dividing everything between the
             // waveforms first would push the logic rows off the bottom.
-            let logic = shared.gpi.len() as f32 * (self.gpi_height + 4.0);
+            let logic_rows = shared
+                .gpi
+                .iter()
+                .filter(|t| self.gpi_shown(t.channel))
+                .count();
+            let logic = logic_rows as f32 * (self.gpi_height + 4.0);
             let available = (ui.available_height() - logic).max(120.0);
             let height = (available / shown.len() as f32) - HEADER;
             let columns = (ui.available_width() as usize).clamp(64, 4096);
@@ -898,7 +1067,7 @@ impl App {
                     threshold: self.threshold_on[i].then_some(self.threshold[i] as f32),
                     edge: self.threshold_edge,
                 };
-                let outcome = plot_signal(
+                let (outcome, resp) = plot_signal(
                     ui,
                     view,
                     &self.buckets,
@@ -911,6 +1080,13 @@ impl App {
                     self.dragging,
                     analysis,
                 );
+                if let Some(t) = outcome.hover_t {
+                    self.hover_t = Some(t);
+                }
+                if let Some(t) = outcome.secondary_t {
+                    self.menu_t = Some(t);
+                }
+                resp.context_menu(|ui| self.marker_menu(ui));
 
                 if let Some(x) = outcome.new_x {
                     // Panning or zooming time stops the trace chasing the
@@ -952,8 +1128,11 @@ impl App {
             // the same time axis and the same markers.
             for i in 0..shared.gpi.len() {
                 let line = &shared.gpi[i];
+                if !self.gpi_shown(line.channel) {
+                    continue;
+                }
                 aggregate_for_view(&line.raw, &line.coarse, x_range, columns, &mut self.buckets);
-                let outcome = plot_logic(
+                let (outcome, resp) = plot_logic(
                     ui,
                     line.channel,
                     &self.buckets,
@@ -963,6 +1142,13 @@ impl App {
                     (self.marker_a, self.marker_b),
                     self.dragging,
                 );
+                if let Some(t) = outcome.hover_t {
+                    self.hover_t = Some(t);
+                }
+                if let Some(t) = outcome.secondary_t {
+                    self.menu_t = Some(t);
+                }
+                resp.context_menu(|ui| self.marker_menu(ui));
                 if let Some(x) = outcome.new_x {
                     self.follow = [false; VIEWS.len()];
                     self.view_x = Some(x);
@@ -1132,6 +1318,13 @@ struct PlotOutcome {
     press: Option<(Option<Grab>, f64)>,
     /// Where the pointer is, while something is held.
     drag_x: Option<f64>,
+    /// Time under the pointer, whenever it is over this plot. This is what
+    /// "place a marker here" means.
+    hover_t: Option<f64>,
+    /// Time under the pointer when the right button went down, kept so the
+    /// context menu can act on where it was opened rather than on where the
+    /// pointer has since moved.
+    secondary_t: Option<f64>,
 }
 
 /// How close, in screen points, the pointer must be to grab a marker.
@@ -1150,7 +1343,7 @@ fn plot_signal(
     markers: (Option<f64>, Option<f64>),
     dragging: Option<Grab>,
     analysis: Analysis,
-) -> PlotOutcome {
+) -> (PlotOutcome, egui::Response) {
     let unit = view.unit;
     let plot = Plot::new(view.name)
         .height(height.max(70.0))
@@ -1361,7 +1554,8 @@ fn plot_signal(
         }
     });
 
-    interact(ui, &response, x, y, markers, dragging)
+    let outcome = interact(ui, &response, x, y, markers, dragging);
+    (outcome, response.response)
 }
 
 /// Colour of a logic trace.
@@ -1387,7 +1581,7 @@ fn plot_logic(
     x: (f64, f64),
     markers: (Option<f64>, Option<f64>),
     dragging: Option<Grab>,
-) -> PlotOutcome {
+) -> (PlotOutcome, egui::Response) {
     let name = gpi_name(channel);
     let plot = Plot::new(format!("gpi{channel}"))
         .height(height.max(24.0))
@@ -1493,7 +1687,7 @@ fn plot_logic(
     // and the markers shared.
     let mut outcome = interact(ui, &response, x, LOGIC_Y, markers, dragging);
     outcome.new_y = None;
-    outcome
+    (outcome, response.response)
 }
 
 /// Display name for a general purpose input.
@@ -1569,9 +1763,20 @@ fn interact(
         new_y: None,
         press: None,
         drag_x: None,
+        hover_t: None,
+        secondary_t: None,
     };
 
     let plot_x = |pos: egui::Pos2| response.transform.value_from_position(pos).x;
+
+    if r.hovered() {
+        out.hover_t = r.hover_pos().map(plot_x);
+        if ui.input(|i| i.pointer.secondary_pressed()) {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                out.secondary_t = Some(plot_x(pos));
+            }
+        }
+    }
 
     // What a press takes hold of is decided at the moment the button goes
     // down, not once the drag is under way. egui only reports a drag after
@@ -2179,6 +2384,32 @@ mod tests {
                 mean: (min + max) / 2.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_marker_goes_under_the_pointer_when_it_is_in_view() {
+        assert_eq!(marker_default(Some(3.0), Some((0.0, 10.0))), Some(3.0));
+    }
+
+    #[test]
+    fn a_marker_falls_back_to_the_middle_of_what_is_drawn() {
+        // This is the case that used to place nothing at all, because it
+        // read a range that is only set once the view has been panned.
+        assert_eq!(marker_default(None, Some((0.0, 10.0))), Some(5.0));
+    }
+
+    #[test]
+    fn a_remembered_pointer_outside_the_view_is_ignored() {
+        // The capture scrolled on; placing a marker back there would put it
+        // somewhere nobody can see.
+        assert_eq!(marker_default(Some(-5.0), Some((0.0, 10.0))), Some(5.0));
+        assert_eq!(marker_default(Some(99.0), Some((0.0, 10.0))), Some(5.0));
+    }
+
+    #[test]
+    fn nothing_drawn_means_nowhere_to_place_a_marker() {
+        assert_eq!(marker_default(Some(3.0), None), None);
+        assert_eq!(marker_default(None, None), None);
     }
 
     #[test]

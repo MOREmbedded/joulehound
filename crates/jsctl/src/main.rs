@@ -333,6 +333,14 @@ struct BenchArgs {
     /// How long to measure for.
     #[arg(short, long, default_value_t = 10.0, value_name = "SECONDS")]
     duration: f64,
+
+    /// After measuring, stop and restart the stream this many times.
+    ///
+    /// Reports how long each restart takes and what the target was drawing
+    /// either side of it. The device is never closed, so the current path
+    /// stays shut and the target keeps its supply.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    restarts: u32,
 }
 
 fn main() -> Result<()> {
@@ -966,7 +974,65 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
     }
     report_gpi(&gpi, &gpi_before, &edges, &last_level, elapsed);
     report_health(&after, &dev, &signals, elapsed);
+
+    if args.restarts > 0 {
+        restart_cycle(&mut dev, args, rate)?;
+    }
     Ok(())
+}
+
+/// Stop and restart the stream repeatedly without closing the device.
+///
+/// This exists because closing the device between captures used to be how the
+/// GUI implemented Stop: it costs seconds, and the instrument's defaults
+/// leave the current range off, so it also cut power to the target. Here the
+/// current either side of each restart says whether the target kept running.
+fn restart_cycle(dev: &mut Js220, args: &BenchArgs, rate: u32) -> Result<()> {
+    println!();
+    for n in 1..=args.restarts {
+        let before = settle_current(dev)?;
+        dev.stream_stop().context("stopping the stream")?;
+
+        let t = Instant::now();
+        let cfg = args.stream.config(false, 2.0)?;
+        dev.stream_start(cfg).context("restarting the stream")?;
+        let gap = t.elapsed().as_secs_f64();
+
+        let after = settle_current(dev)?;
+        let report = |label: &str, v: Option<f64>| match v {
+            Some(v) => format!("{label} {}", fmt::si(v, "A")),
+            None => format!("{label} no samples"),
+        };
+        println!(
+            "restart {n}          {:.3} s, {}, {}",
+            gap,
+            report("before", before),
+            report("after", after)
+        );
+    }
+    println!("rate requested      {rate} Hz");
+    Ok(())
+}
+
+/// Mean current over a short window, or None if nothing arrived.
+fn settle_current(dev: &mut Js220) -> js220::Result<Option<f64>> {
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let (mut sum, mut count) = (0.0f64, 0u64);
+    while Instant::now() < deadline {
+        dev.poll(POLL_TIMEOUT)?;
+        let rows = dev.rows();
+        let n = rows.len;
+        if let Some(current) = rows.current {
+            for v in &current[..n] {
+                if v.is_finite() {
+                    sum += *v as f64;
+                    count += 1;
+                }
+            }
+        }
+        dev.consume(n);
+    }
+    Ok((count > 0).then(|| sum / count as f64))
 }
 
 /// Fold the GPI blocks waiting on the device into a per-channel edge count.

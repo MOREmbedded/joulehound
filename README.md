@@ -114,10 +114,11 @@ data and following live data does not stamp out a Y zoom. *Fit* turns both back
 on. A view the data has scrolled past snaps back to the live edge rather than
 stranding you on an empty plot.
 
-**Markers.** `A|B` places a pair, `A` places one, `✖` clears them. They are
-dragged directly in any plot and appear at the same instant in all of them;
-dragging *between* a pair moves both rigidly, which is how a measurement window
-is positioned once its width is right.
+**Markers.** `A|B` places a pair around the pointer, `A` places one there,
+`✖` clears them; right-clicking any plot offers the same at the point you
+clicked. They are dragged directly in any plot and appear at the same instant
+in all of them; dragging *between* a pair moves both rigidly, which is how a
+measurement window is positioned once its width is right.
 Each is labelled with the value underneath it, and the span's statistics are
 drawn beside it inside the plot — avg, std, rms, min, max, p2p, and the time
 integral where one is meaningful, so current integrates to charge and power to
@@ -159,6 +160,12 @@ from the command line instead.
 reference you drive on the Vref pin; with nothing connected there the inputs
 read a fixed level and no edge ever appears. **3.3 V** has the instrument
 supply the reference itself.
+
+**Stop does not disturb the target.** Stopping closes the instrument's data
+ports but keeps the device open, so the current path stays shut and whatever
+is being measured keeps running. Starting again takes about 0.35 s. `⏏`
+releases the instrument deliberately, and that *does* cut the target: the
+JS220 reverts to its own defaults on disconnect, and those open the path.
 
 **Recording** writes the same interleaved little-endian `f32` format `jsctl`
 produces, so the two are interchangeable.
@@ -255,6 +262,7 @@ round-tripping through real files.
 | Capture, 1 ksps CSV | 1,999 rows in 2.001 s, sample ids advancing by 2000 |
 | GPI, all five lines | **2.00 Msps each**, 0 filled, 0 discontinuities, at 8.72 MiB/s |
 | GUI, three logic lines | 1.01 M samples/s at 8.53 MiB/s |
+| Stream restart, device held open | **0.35 s**, target current continuous across it (was 1.29 s) |
 | GUI, all five logic lines | 1.08 M samples/s at 9.73 MiB/s, 2 min 47 s unbroken, no frame errors, ~1.15 cores |
 
 GPI **levels** are not verified. Nothing is connected to the input pins here,

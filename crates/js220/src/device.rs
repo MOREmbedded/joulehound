@@ -34,6 +34,13 @@ const ECHO_ATTEMPTS: u32 = 10;
 /// arrives to belong to the new state.
 const SETTLE: Duration = Duration::from_millis(250);
 
+/// How long to wait for an echo reply before poking the device again.
+///
+/// The instrument holds a port 0 reply until it next receives a frame, so the
+/// poke is what delivers the previous answer. Short, because the round trip
+/// itself takes a millisecond or two.
+const ECHO_POKE: Duration = Duration::from_millis(40);
+
 // Range enumerations, taken from the options tables the instrument publishes in
 // its own metadata. Run `jsctl topics` to print them from a live device.
 
@@ -520,6 +527,18 @@ impl Js220 {
         // all, and no amount of re-enabling recovers it. The reference driver
         // restores every parameter on open for this reason.
         dev.restore_defaults()?;
+
+        // The defaults set the current range mode to 0, which is "off": the
+        // ranging MOSFETs open and the target, which sits in series with
+        // them, loses its supply. That is the instrument's own power-on
+        // state and fine as a starting point, but leaving it there means
+        // merely opening the device cuts power to whatever is attached. The
+        // path is closed again here so that opening the device is not, by
+        // itself, an action on the target.
+        dev.publish(topics::S_CURRENT_RANGE_MODE, Value::U8(RANGE_MODE_AUTO))?;
+        dev.sync_output()?;
+        dev.target_power = true;
+
         Ok(dev)
     }
 
@@ -540,25 +559,54 @@ impl Js220 {
 
     /// Round-trip port 0 echoes until one comes back.
     fn sync_output(&mut self) -> Result<()> {
+        // The instrument does not flush a port 0 reply on its own: it holds
+        // the answer until it next receives a frame. So the first echo of any
+        // barrier always looks unanswered, and it is the *next* echo that
+        // carries the previous reply out. Waiting half a second between them,
+        // as this used to, charged a full second to every barrier for a round
+        // trip the device had finished in milliseconds — which is what made
+        // starting a stream feel slow. Poking promptly is what makes it
+        // quick, and the extra echoes cost nothing.
+        //
+        // Every token sent this round stays acceptable, because the reply
+        // that arrives is the earlier one, not the poke that shook it loose.
+        let mut pending: Vec<u32> = Vec::with_capacity(ECHO_ATTEMPTS as usize);
+        self.last_echo = None;
+        let give_up = Instant::now() + ECHO_TIMEOUT * ECHO_ATTEMPTS;
+
         for attempt in 1..=ECHO_ATTEMPTS {
             let token = 0xA5A5_0000u32 | attempt;
-            let payload = js220_proto::port0::encode_echo(&token.to_le_bytes());
-            self.last_echo = None;
-            self.link.send_frame(frame::PORT_ADMIN, &payload)?;
-
-            let deadline = Instant::now() + ECHO_TIMEOUT;
-            while Instant::now() < deadline {
-                self.poll(Duration::from_millis(20))?;
-                if self.last_echo == Some(token) {
-                    log::debug!("bulk OUT confirmed after {attempt} echo(es)");
-                    return Ok(());
-                }
+            pending.push(token);
+            self.send_echo(token)?;
+            if self.await_echo(&pending, ECHO_POKE)? {
+                log::debug!("bulk OUT confirmed after {attempt} echo(es)");
+                return Ok(());
             }
-            log::debug!("echo attempt {attempt} unanswered");
+            if Instant::now() >= give_up {
+                break;
+            }
         }
         Err(Error::Timeout {
             context: "a port 0 echo confirming the output path",
         })
+    }
+
+    /// Send one port 0 echo.
+    fn send_echo(&mut self, token: u32) -> Result<()> {
+        let payload = js220_proto::port0::encode_echo(&token.to_le_bytes());
+        self.link.send_frame(frame::PORT_ADMIN, &payload)
+    }
+
+    /// Poll until one of `pending` comes back, or `timeout` elapses.
+    fn await_echo(&mut self, pending: &[u32], timeout: Duration) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.poll(Duration::from_millis(5))?;
+            if self.last_echo.is_some_and(|t| pending.contains(&t)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Poll for `duration`, discarding whatever arrives.
@@ -871,16 +919,20 @@ impl Js220 {
             self.publish(topics::S_STATS_CTRL, Value::U8(1))?;
         }
 
+        self.link.prime();
+        self.config = Some(config);
+        self.streaming = true;
+
         // The configuration above is a burst of publishes, and a completed
         // bulk OUT transfer is not evidence the device received one. Without
         // this barrier the tail of the burst is silently lost: enabling five
         // GPI lines reliably produced three or four of them, varying run to
-        // run, because the last publishes never landed.
+        // run, because the last publishes never landed. The device handles
+        // frames in order, so an echo coming back proves every publish ahead
+        // of it was acted on.
+        //
+        // Done after priming so the IN queue is armed when the reply lands.
         self.sync_output()?;
-
-        self.link.prime();
-        self.config = Some(config);
-        self.streaming = true;
 
         // Give the instrument a moment to apply the settings, then discard
         // everything received up to this point: it was queued before the
@@ -1167,6 +1219,61 @@ impl Js220 {
         pstream::decode_u1_packed(data, &mut bits);
         self.gpi[slot].push(raw_id, &bits);
         self.gpi_scratch = bits;
+    }
+
+    /// Change which general purpose inputs are captured, without restarting.
+    ///
+    /// The GPI ports are independent of the analog ones, so a line can be
+    /// enabled or dropped mid-capture: only the ports that actually change
+    /// are published, and lines that stay keep their accumulated samples.
+    /// Doing this through `stream_start` instead would reset the time axis
+    /// and throw away the capture so far.
+    pub fn set_gpi(&mut self, channels: &[u8]) -> Result<()> {
+        for &channel in channels {
+            if pstream::gpi_index(channel).is_none() {
+                return Err(Error::Config {
+                    reason: format!(
+                        "GPI channel {channel} does not exist; the instrument has {:?}",
+                        pstream::GPI_CHANNELS
+                    ),
+                });
+            }
+        }
+
+        let mut changed = false;
+        for &channel in &pstream::GPI_CHANNELS {
+            let want = channels.contains(&channel);
+            let have = self.gpi.iter().any(|c| c.channel() == channel);
+            if want == have {
+                continue;
+            }
+            let topic = topics::gpi_ctrl(channel).ok_or_else(|| Error::Config {
+                reason: format!("GPI channel {channel} does not exist"),
+            })?;
+            self.publish(topic, Value::U8(u8::from(want)))?;
+            changed = true;
+            if want {
+                let max_fill = (BASE_RATE as usize / 100).max(16);
+                self.gpi.push(GpiChannel::new(channel, max_fill));
+            } else {
+                self.gpi.retain(|c| c.channel() != channel);
+            }
+        }
+
+        if changed {
+            // The same barrier the start path needs: without it the tail of
+            // this burst can be lost and a line asked for never arrives.
+            self.sync_output()?;
+            if let Some(cfg) = self.config.as_mut() {
+                cfg.gpi = channels.to_vec();
+            }
+        }
+        Ok(())
+    }
+
+    /// Which general purpose inputs are currently being captured.
+    pub fn gpi_channels(&self) -> Vec<u8> {
+        self.gpi.iter().map(|c| c.channel()).collect()
     }
 
     /// Take the general purpose input samples accumulated since the last call.
