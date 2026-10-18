@@ -297,11 +297,15 @@ hostage until enough replies accumulate to fill it.
 
 ### Known gaps
 
-- **Power statistics are not trustworthy.** With the power port disabled, the
-  instrument reports a power minimum that never changes and a standard
-  deviation and maximum of exactly zero, so those fields are evidently not
-  being updated. Current and voltage statistics, and the charge and energy
-  accumulators, behave correctly. Treat `power` in `jsctl stats` as unverified.
+- **Power statistics were once wrong and are not any more, for reasons that
+  were never established.** An earlier build reported a power minimum that
+  never changed and a standard deviation and maximum of exactly zero. They are
+  now fully populated and check out: over a 500 k sample block the reported
+  power mean matched current mean x voltage mean to four figures, with the
+  minimum and maximum tracking too, across every run tried. Removing the
+  output barrier added for the GPI lines did not bring the old behaviour back,
+  so that was not the cause. Recorded here rather than deleted, because a
+  defect that disappears without a diagnosis can return the same way.
 - Stream startup is not perfectly uniform: most runs reach 100% of the
   requested rate, but an occasional run comes in lower. Capture also discards
   the first fraction of a second while the stream settles, so a short capture
@@ -310,6 +314,14 @@ hostage until enough replies accumulate to fill it.
   them stops the instrument emitting statistics after the first record, so
   `jsctl stats` runs with every data port off. The cause is not understood;
   the official tool does the same.
+- **The first metadata request after a streaming session goes unanswered.**
+  The device accepts the connect and passes the output barrier, then simply
+  sends no metadata; asking a second time always works. This is not specific
+  to the GPI lines — a plain 1 Msps run and a raw 2 Msps run both do it.
+  `jsctl topics` now asks up to three times and says so when it has to.
+- **`jsctl reset` cannot work on Windows.** WinUSB offers no port reset, so
+  the command reports that and tells you to unplug the instrument instead,
+  which has the same effect.
 - GPI levels are unverified. The lines stream at exactly 2 Msps with no gaps,
   but nothing is wired to the inputs here, so every line reads low and no edge
   has been observed. The instrument has no output that could drive one.

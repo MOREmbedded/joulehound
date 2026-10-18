@@ -465,7 +465,7 @@ impl App {
                             for r in RATES {
                                 ui.selectable_value(&mut self.rate, r, rate_label(r))
                                     .on_hover_text(if r >= js220::BASE_RATE {
-                                        "Uncalibrated ADC counts: no gain, offset or                                          range correction applied"
+                                        "Uncalibrated ADC counts: no gain, offset or range correction applied"
                                     } else {
                                         "Calibrated amperes and volts"
                                     });
@@ -615,7 +615,7 @@ impl App {
                         ui.label("Compare against:");
                         ui.radio_value(&mut self.gpio_vref, GpioVref::External, "External Vref")
                             .on_hover_text(
-                                "Senses against the reference you drive on the Vref                                  pin. With nothing connected there the inputs read a                                  fixed level and no edge ever appears.",
+                                "Senses against the reference you drive on the Vref pin. With nothing connected there the inputs read a fixed level and no edge ever appears.",
                             );
                         ui.radio_value(&mut self.gpio_vref, GpioVref::V3p3, "3.3 V")
                             .on_hover_text("The instrument supplies the reference itself");
@@ -643,7 +643,7 @@ impl App {
                             .suffix(" rows"),
                     )
                     .on_hover_text(
-                        "Each row carries the mean, minimum and maximum of one                          time slice, so short spikes survive the export.",
+                        "Each row carries the mean, minimum and maximum of one time slice, so short spikes survive the export.",
                     );
                     ui.separator();
                     let markers = self.export_range(ExportSpan::Markers).is_some();
@@ -699,7 +699,7 @@ impl App {
                 if ui
                     .add_enabled(running, button)
                     .on_hover_text(
-                        "Open or close the current path. Switching off removes power                          from the target and will reset it.",
+                        "Open or close the current path through the instrument. The JS220 sits in series with the target, so opening it should cut the target's supply and reset it — confirm at the target, not from the current reading, which measures nothing once the path is open.",
                     )
                     .clicked()
                 {

@@ -423,7 +423,16 @@ fn drain_until_quiet(dev: &mut Js220, quiet: Duration, max: Duration) -> Result<
 fn cmd_reset(args: &DeviceArgs) -> Result<()> {
     let info = js220::find(args.serial.as_deref()).context("finding the device")?;
     eprintln!("resetting {} ...", info.serial());
-    js220::usb::reset(&info).context("resetting the device")?;
+    if let Err(e) = js220::usb::reset(&info) {
+        // WinUSB has no port reset, so this cannot work on Windows however
+        // the driver asks. Say what to do instead rather than printing an
+        // error chain against a command whose whole purpose is recovery.
+        bail!(
+            "{e}
+
+This host cannot issue a USB reset. Unplug the instrument and plug it back in, which has the same effect."
+        );
+    }
     // The device re-enumerates, so it is briefly absent from the bus.
     std::thread::sleep(Duration::from_millis(2000));
     match js220::find(args.serial.as_deref()) {
@@ -451,9 +460,9 @@ fn cmd_power(args: &PowerArgs) -> Result<()> {
     eprintln!(
         "target power {}",
         if on {
-            "ON"
+            "ON (the current path is closed)"
         } else {
-            "OFF (the target has lost power)"
+            "OFF (the current path is open)"
         }
     );
 
@@ -477,10 +486,20 @@ fn cmd_power(args: &PowerArgs) -> Result<()> {
         }
         dev.consume(n);
     }
-    if count > 0 {
+    // Only meaningful while a range is engaged. Switching off opens the
+    // current path, so the ADC is reading an unranged input: whatever number
+    // comes back is not a measurement of the target, and printing it bare
+    // invites exactly the wrong conclusion.
+    if count == 0 {
+        println!("no current samples arrived");
+    } else if on {
         println!("measured current {}", fmt::si(sum / count as f64, "A"));
     } else {
-        println!("no current samples arrived");
+        println!(
+            "reading {} with the path open, which measures nothing;
+check the target itself to confirm it lost power",
+            fmt::si(sum / count as f64, "A")
+        );
     }
     eprintln!(
         "held for {:.1} s; the instrument reverts on disconnect",
@@ -580,10 +599,25 @@ fn cmd_topics(args: &TopicsArgs) -> Result<()> {
 
     // The metadata dump is hundreds of messages, so this is requested only by
     // the commands that actually need it, and given time to arrive.
-    dev.request_metadata().context("requesting metadata")?;
-    drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(8))?;
-    dev.request_values().context("requesting values")?;
-    drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(6))?;
+    //
+    // Asked for more than once because the first request after a streaming
+    // session routinely goes unanswered: the device accepts the connect, the
+    // echo barrier passes, and then nothing comes back. A second attempt has
+    // always worked. The cause is not understood, so this retries rather than
+    // pretending the device has no topics.
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        dev.request_metadata().context("requesting metadata")?;
+        drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(8))?;
+        dev.request_values().context("requesting values")?;
+        drain_until_quiet(&mut dev, Duration::from_millis(400), Duration::from_secs(6))?;
+        if dev.params().keys().any(|t| t.ends_with('$')) {
+            break;
+        }
+        if attempt < ATTEMPTS {
+            eprintln!("no metadata yet; asking again ({attempt}/{ATTEMPTS})");
+        }
+    }
 
     let params = dev.params();
 
@@ -610,9 +644,12 @@ fn cmd_topics(args: &TopicsArgs) -> Result<()> {
     rows.sort();
 
     if rows.is_empty() {
-        println!(
-            "No matching topics. The device publishes metadata on connect; try without --filter."
-        );
+        match &args.filter {
+            Some(f) => println!("No topic matches {f:?}. Run without --filter to see them all."),
+            None => println!(
+                "The device reported no topics, after {ATTEMPTS} attempts.                  Unplugging and reconnecting it clears this."
+            ),
+        }
         return Ok(());
     }
     for (topic, described, current) in &rows {
@@ -845,6 +882,10 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         .iter()
         .map(|s| dev.signal_counters(*s).map_or(0, |c| c.samples))
         .collect();
+    // GPI counters accumulate from stream_start too, so the warm-up has to
+    // come out of them or the reported rate is inflated by whatever was
+    // captured before the clock started.
+    let gpi_before = dev.gpi_counters();
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(args.duration);
     let mut rows_total: u64 = 0;
@@ -923,7 +964,7 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         let achieved = real as f64 / elapsed / rate as f64 * 100.0;
         println!("rate achieved       {achieved:.2}% of requested (real samples)");
     }
-    report_gpi(&gpi, &edges, &last_level, elapsed);
+    report_gpi(&gpi, &gpi_before, &edges, &last_level, elapsed);
     report_health(&after, &dev, &signals, elapsed);
     Ok(())
 }
@@ -955,6 +996,7 @@ fn count_gpi_edges(dev: &mut Js220, edges: &mut Vec<(u8, u64)>, last: &mut Vec<(
 /// Report what each enabled GPI line delivered.
 fn report_gpi(
     counters: &[(u8, js220::GpiCounters)],
+    before: &[(u8, js220::GpiCounters)],
     edges: &[(u8, u64)],
     levels: &[(u8, u8)],
     elapsed: f64,
@@ -964,6 +1006,11 @@ fn report_gpi(
     }
     println!();
     for &(channel, c) in counters {
+        let base = before
+            .iter()
+            .find(|(ch, _)| *ch == channel)
+            .map_or(0, |(_, b)| b.samples);
+        let samples = c.samples.saturating_sub(base);
         let n = edges
             .iter()
             .find(|(ch, _)| *ch == channel)
@@ -976,9 +1023,8 @@ fn report_gpi(
             None => "no data",
         };
         println!(
-            "gpi {channel}               {} samples ({:.0}/s), {n} edges,              last {level}, {} filled, {} discontinuities",
-            c.samples,
-            c.samples as f64 / elapsed,
+            "gpi {channel}               {samples} samples ({:.0}/s), {n} edges,              last {level}, {} filled, {} discontinuities",
+            samples as f64 / elapsed,
             c.filled,
             c.discontinuities
         );

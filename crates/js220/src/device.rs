@@ -932,6 +932,17 @@ impl Js220 {
         self.adc_map = None;
         self.group.reset();
         self.power.clear();
+
+        // The same barrier the start path needs, for the same reason. Without
+        // it the tail of this burst is lost and the device keeps streaming
+        // ports this session believes it closed; the next session then opens
+        // into a flood and its metadata request is never answered, which
+        // showed up as `jsctl topics` reporting nothing at all after any run
+        // that used the GPI lines.
+        if let Err(e) = self.sync_output() {
+            first_err.get_or_insert(e);
+        }
+
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
